@@ -27,23 +27,34 @@ WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 async def fetch_url_as_markdown(
     url: str,
     wait_until: WaitUntil = "load",
-    timeout_ms: int = 30000,
+    timeout_ms: int = 60000,
+    headless: bool = True,
 ) -> str:
     """Fetch a URL through Chromium and return the main content as Markdown.
 
-    Uses Playwright with a real browser, which bypasses most Cloudflare bot
-    challenges and renders JavaScript-required pages. The fetched HTML is
-    then passed through trafilatura, which strips navigation, ads, sidebars,
-    and footers and converts the article body to Markdown.
+    Uses patchright (a Playwright fork with anti-detection patches) to drive
+    real Chromium, which clears most Cloudflare bot challenges and renders
+    JavaScript-required pages. The fetched HTML is then passed through
+    trafilatura, which strips navigation, ads, sidebars, and footers and
+    converts the article body to Markdown.
 
     Args:
         url: The URL to fetch.
         wait_until: When to consider navigation complete. "load" (default)
-            waits for the load event. "domcontentloaded" is faster but may
-            miss late-rendered content. "networkidle" waits for network to
-            quiet — best for SPAs but slower. "commit" returns as soon as
-            the response starts.
-        timeout_ms: Navigation timeout in milliseconds. Default 30000.
+            waits for the load event. "domcontentloaded" is faster and
+            sometimes more forgiving on Cloudflare challenges. "networkidle"
+            waits for network to quiet — best for SPAs but slower. "commit"
+            returns as soon as the response starts.
+        timeout_ms: Navigation timeout in milliseconds. Default 60000.
+        headless: Whether to run Chromium headless. Default True. Set to
+            False to use a visible browser window — slower and pops a
+            Chromium window on screen, but clears bot-detection challenges
+            (Cloudflare, etc.) that block headless mode. If a fetch returns
+            "ERROR: navigation timed out" or "ERROR: no extractable content"
+            on a site that likely has bot protection, retry with
+            headless=False. Requires a display, so headless=False fails on
+            servers without a graphical environment unless a virtual
+            display like Xvfb is configured.
 
     Returns:
         The page's main content as Markdown, or a string starting with
@@ -52,7 +63,7 @@ async def fetch_url_as_markdown(
     """
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=headless)
             try:
                 context = await browser.new_context()
                 page = await context.new_page()

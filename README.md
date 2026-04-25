@@ -9,7 +9,9 @@ Most MCP web-fetch tools either:
 - use plain HTTP, which fails on JS-required pages and gets blocked by Cloudflare bot detection on many sites; or
 - use a real browser but return raw HTML or accessibility-tree snapshots, which are noisy and token-heavy when you just want to read the article.
 
-This server uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) to drive real Chromium — clearing most Cloudflare bot challenges that vanilla headless Playwright now fails on — and then [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
+This server uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) to drive real Chromium, and [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
+
+Headless mode is the default and works on standard pages. For sites with active bot detection (Cloudflare challenges and similar), pass `headless=False` to use a visible Chromium window — slower and visually intrusive, but clears most challenges that block headless mode.
 
 For a typical article, expect roughly 80% fewer tokens than the raw HTML and roughly 90% fewer than a full accessibility-tree snapshot.
 
@@ -74,7 +76,8 @@ The server exposes a single tool:
 |--------------|--------|----------|-----------------------------------------------------------------------------|
 | `url`        | string | required | The URL to fetch                                                            |
 | `wait_until` | string | `"load"` | `"load"`, `"domcontentloaded"`, `"networkidle"`, or `"commit"`              |
-| `timeout_ms` | int    | `30000`  | Navigation timeout in milliseconds                                          |
+| `timeout_ms` | int    | `60000`  | Navigation timeout in milliseconds                                          |
+| `headless`   | bool   | `true`   | `false` uses a visible browser window — slower but clears more bot detection |
 
 **Returns** Markdown as a string, or a string beginning with `"ERROR:"` on expected failures (timeout, no extractable content, navigation error).
 
@@ -94,8 +97,9 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 ## Limitations
 
 - **Cold start.** Each call launches a fresh Chromium (~1–2 s overhead). A persistent browser instance is on the v2 roadmap.
-- **Hardest WAF configs still block headless.** patchright clears Cloudflare's default settings reliably and most stricter ones, but sites running aggressive Bot Fight Mode, Turnstile interactive challenges, or commercial bot-management products (PerimeterX, DataDome, Kasada) still detect headless Chromium. Running headed (`headless=False`) helps in some of these cases — exposing this as a parameter is on the roadmap.
-- **Datacenter IPs.** Cloudflare's harder challenges still block requests from datacenter IPs (Oracle Cloud, AWS, etc.) regardless of browser fingerprint. Best results come from running this on a residential connection.
+- **Bot detection on hard sites.** patchright headless clears default Cloudflare configurations on many sites, but pages running aggressive Bot Fight Mode, Turnstile interactive challenges, or commercial bot-management products (PerimeterX, DataDome, Kasada) — and Cloudflare's own marketing site — still detect headless Chromium. Pass `headless=False` to use a visible browser window, which clears most of these. The cost is a Chromium window flashing on screen for a couple of seconds per fetch.
+- **Headed mode requires a display.** `headless=False` fails on servers without a graphical environment (cloud VMs, containers, CI). Use a virtual display like Xvfb if you need headed mode in those environments.
+- **Datacenter IPs.** Cloudflare's harder challenges still block requests from datacenter IPs (Oracle Cloud, AWS, etc.) regardless of browser fingerprint or headed/headless mode. Best results come from running this on a residential connection.
 - **Heavy SPAs.** Pages that render content well after `load` may need `wait_until="networkidle"`.
 - **Auth-walled content.** This server uses a clean browser context with no cookies or stored auth. Logged-in pages won't work.
 
@@ -109,10 +113,10 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 
 - [ ] Persistent browser instance to amortize cold start
 - [ ] `Accept: text/markdown` fast path for [Cloudflare's Markdown for Agents](https://blog.cloudflare.com/introducing-markdown-for-agents/)
-- [ ] Optional `headless=False` for the hardest WAF configs
 - [ ] Optional `selector` parameter to scope extraction
 - [ ] Optional viewport, user-agent, and locale overrides
 - [ ] Optional persistent browser context for sticky cookies / WAF trust
+- [ ] `channel="chrome"` option to use installed Google Chrome instead of bundled Chromium (further stealth for the hardest sites)
 
 ## Contributing
 
