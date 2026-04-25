@@ -11,6 +11,8 @@ Most MCP web-fetch tools either:
 
 This server uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) to drive real Chromium, and [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
 
+After navigation, the server polls the DOM and runs trafilatura, returning as soon as two consecutive polls produce the same extraction. This means it returns within a few hundred milliseconds for typical pages — rather than waiting for analytics, ads, and other late-loading resources to finish — and gives slow SPAs and bot-challenge clearance time to settle without timing out prematurely.
+
 Headless mode is the default and works on standard pages. For sites with active bot detection (Cloudflare challenges and similar), pass `headless=False` to use a visible Chromium window — slower and visually intrusive, but clears most challenges that block headless mode.
 
 For a typical article, expect roughly 80% fewer tokens than the raw HTML and roughly 90% fewer than a full accessibility-tree snapshot.
@@ -72,12 +74,14 @@ The server exposes a single tool:
 
 ### `fetch_url_as_markdown`
 
-| Parameter    | Type   | Default  | Description                                                                 |
-|--------------|--------|----------|-----------------------------------------------------------------------------|
-| `url`        | string | required | The URL to fetch                                                            |
-| `wait_until` | string | `"load"` | `"load"`, `"domcontentloaded"`, `"networkidle"`, or `"commit"`              |
-| `timeout_ms` | int    | `60000`  | Navigation timeout in milliseconds                                          |
-| `headless`   | bool   | `true`   | `false` uses a visible browser window — slower but clears more bot detection |
+| Parameter            | Type   | Default              | Description                                                                              |
+|----------------------|--------|----------------------|------------------------------------------------------------------------------------------|
+| `url`                | string | required             | The URL to fetch                                                                         |
+| `wait_until`         | string | `"domcontentloaded"` | When navigation completes: `"load"`, `"domcontentloaded"`, `"networkidle"`, `"commit"`   |
+| `timeout_ms`         | int    | `60000`              | Navigation-step timeout in milliseconds                                                  |
+| `headless`           | bool   | `true`               | `false` uses a visible browser window — slower but clears more bot detection             |
+| `poll_budget_ms`     | int    | `5000`               | Max time after navigation to wait for content stabilization                              |
+| `poll_interval_ms`   | int    | `250`                | How often to re-attempt extraction during polling                                        |
 
 **Returns** Markdown as a string, or a string beginning with `"ERROR:"` on expected failures (timeout, no extractable content, navigation error).
 
@@ -89,18 +93,21 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 
 `wait_until` choice:
 
-- `"load"` (default) — waits for the load event, suitable for most pages
-- `"domcontentloaded"` — faster, but may miss late-rendered content
-- `"networkidle"` — waits for network to quiet, best for SPAs, slower
-- `"commit"` — returns as soon as the response starts, rarely what you want
+- `"domcontentloaded"` (default) — returns when the DOM is built; content-stabilization polling handles the rest
+- `"load"` — waits for all subresources (images, scripts, stylesheets); rarely needed since polling runs after this
+- `"networkidle"` — waits for network to quiet; sometimes hangs on pages with persistent background connections
+- `"commit"` — returns as soon as the response starts; rarely useful
+
+**When to bump `poll_budget_ms`:** the 5-second default is fine for typical pages but may return a partial extraction on slow SPAs that render content over many seconds, and may time out before a bot-detection challenge clears in headed mode. For headed-mode fetches of bot-protected sites, 10000-15000 is a reasonable budget.
 
 ## Limitations
 
 - **Cold start.** Each call launches a fresh Chromium (~1–2 s overhead). A persistent browser instance is on the v2 roadmap.
 - **Bot detection on hard sites.** patchright headless clears default Cloudflare configurations on many sites, but pages running aggressive Bot Fight Mode, Turnstile interactive challenges, or commercial bot-management products (PerimeterX, DataDome, Kasada) — and Cloudflare's own marketing site — still detect headless Chromium. Pass `headless=False` to use a visible browser window, which clears most of these. The cost is a Chromium window flashing on screen for a couple of seconds per fetch.
+- **Headed-mode bot challenges need a generous polling budget.** When using `headless=False` on bot-protected sites, the challenge can take 5-15 seconds to clear. Set `poll_budget_ms` to 10000-15000 for these cases — the 5000 default may return prematurely while the challenge is still resolving.
 - **Headed mode requires a display.** `headless=False` fails on servers without a graphical environment (cloud VMs, containers, CI). Use a virtual display like Xvfb if you need headed mode in those environments.
 - **Datacenter IPs.** Cloudflare's harder challenges still block requests from datacenter IPs (Oracle Cloud, AWS, etc.) regardless of browser fingerprint or headed/headless mode. Best results come from running this on a residential connection.
-- **Heavy SPAs.** Pages that render content well after `load` may need `wait_until="networkidle"`.
+- **Slow SPA rendering.** For pages that progressively render content over many seconds, bump `poll_budget_ms`. The default returns the most-recent extraction at budget expiry, which on a still-rendering SPA may be partial.
 - **Auth-walled content.** This server uses a clean browser context with no cookies or stored auth. Logged-in pages won't work.
 
 ## Comparison with related tools
