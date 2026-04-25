@@ -1,0 +1,49 @@
+[project]
+name = "playwright-markdown-mcp"
+version = "0.1.0"
+description = "MCP server that fetches URLs through real Chromium and returns clean Markdown"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Sidney Markowitz" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "markdown",
+    "web-scraping",
+    "cloudflare",
+    "llm-tooling",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "fastmcp>=0.2.0",
+    "playwright>=1.40.0",
+    "trafilatura>=1.12.0",
+]
+
+[project.scripts]
+playwright-markdown-mcp = "playwright_markdown_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/sidney/playwright-markdown-mcp"
+Repository = "https://github.com/sidney/playwright-markdown-mcp"
+Issues = "https://github.com/sidney/playwright-markdown-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playwright_markdown_mcp"]
