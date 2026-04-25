@@ -9,7 +9,7 @@ Most MCP web-fetch tools either:
 - use plain HTTP, which fails on JS-required pages and gets blocked by Cloudflare bot detection on many sites; or
 - use a real browser but return raw HTML or accessibility-tree snapshots, which are noisy and token-heavy when you just want to read the article.
 
-This server uses Playwright (real Chromium) to load the page — bypassing most Cloudflare WAF challenges and rendering JS-heavy pages — and then [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
+This server uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) to drive real Chromium — clearing most Cloudflare bot challenges that vanilla headless Playwright now fails on — and then [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
 
 For a typical article, expect roughly 80% fewer tokens than the raw HTML and roughly 90% fewer than a full accessibility-tree snapshot.
 
@@ -25,7 +25,7 @@ uvx playwright-markdown-mcp
 pip install playwright-markdown-mcp
 
 # One-time browser download
-playwright install chromium
+patchright install chromium
 ```
 
 ## MCP client configuration
@@ -94,7 +94,8 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 ## Limitations
 
 - **Cold start.** Each call launches a fresh Chromium (~1–2 s overhead). A persistent browser instance is on the v2 roadmap.
-- **Datacenter IPs.** Cloudflare's harder challenges still block requests from datacenter IPs (Oracle Cloud, AWS, etc.) even with a real browser. Best results come from running this on a residential connection.
+- **Hardest WAF configs still block headless.** patchright clears Cloudflare's default settings reliably and most stricter ones, but sites running aggressive Bot Fight Mode, Turnstile interactive challenges, or commercial bot-management products (PerimeterX, DataDome, Kasada) still detect headless Chromium. Running headed (`headless=False`) helps in some of these cases — exposing this as a parameter is on the roadmap.
+- **Datacenter IPs.** Cloudflare's harder challenges still block requests from datacenter IPs (Oracle Cloud, AWS, etc.) regardless of browser fingerprint. Best results come from running this on a residential connection.
 - **Heavy SPAs.** Pages that render content well after `load` may need `wait_until="networkidle"`.
 - **Auth-walled content.** This server uses a clean browser context with no cookies or stored auth. Logged-in pages won't work.
 
@@ -108,6 +109,7 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 
 - [ ] Persistent browser instance to amortize cold start
 - [ ] `Accept: text/markdown` fast path for [Cloudflare's Markdown for Agents](https://blog.cloudflare.com/introducing-markdown-for-agents/)
+- [ ] Optional `headless=False` for the hardest WAF configs
 - [ ] Optional `selector` parameter to scope extraction
 - [ ] Optional viewport, user-agent, and locale overrides
 - [ ] Optional persistent browser context for sticky cookies / WAF trust

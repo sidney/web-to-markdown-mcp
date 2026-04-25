@@ -11,7 +11,7 @@ from typing import Literal
 
 import trafilatura
 from fastmcp import FastMCP
-from playwright.async_api import (
+from patchright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
