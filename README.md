@@ -1,4 +1,4 @@
-# playwright-markdown-mcp
+# web-to-markdown-mcp
 
 An [MCP](https://modelcontextprotocol.io) server that fetches a URL through a real Chromium browser and returns the main content as clean Markdown.
 
@@ -27,10 +27,10 @@ Requires Python 3.10+ and a one-time Chromium download (~300 MB).
 
 ```bash
 # Run directly with uv (no install step)
-uvx playwright-markdown-mcp
+uvx web-to-markdown-mcp
 
 # Or install with pip
-pip install playwright-markdown-mcp
+pip install web-to-markdown-mcp
 
 # One-time browser download
 patchright install chromium
@@ -48,9 +48,9 @@ Edit your config file:
 ```json
 {
   "mcpServers": {
-    "playwright-markdown": {
+    "web-to-markdown": {
       "command": "uvx",
-      "args": ["playwright-markdown-mcp"]
+      "args": ["web-to-markdown-mcp"]
     }
   }
 }
@@ -69,7 +69,7 @@ Same JSON block, in each client's MCP config location.
 ### Claude Code
 
 ```bash
-claude mcp add playwright-markdown -- uvx playwright-markdown-mcp
+claude mcp add web-to-markdown -- uvx web-to-markdown-mcp
 ```
 
 ## Usage

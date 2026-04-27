@@ -1,8 +1,8 @@
-"""Playwright Markdown MCP server.
+"""web-to-markdown-mcp server.
 
-Fetches URLs through a real Chromium browser (bypassing most Cloudflare
-bot challenges and JS-required pages) and returns the main content as
-clean Markdown.
+Fetches URLs and returns the main content as clean Markdown. Tries an
+HTTP content-negotiation fast-path first (Accept: text/markdown); falls
+back to real Chromium via patchright for JS-heavy and bot-protected pages.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from patchright.async_api import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("playwright-markdown")
+mcp = FastMCP("web-to-markdown")
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 
@@ -200,7 +200,7 @@ async def _poll_until_stable(
 
 
 def main() -> None:
-    """Entry point for the playwright-markdown-mcp script."""
+    """Entry point for the web-to-markdown-mcp script."""
     mcp.run()
 
 
