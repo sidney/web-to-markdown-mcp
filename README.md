@@ -1,7 +1,7 @@
 # web-to-markdown-mcp
 <!-- mcp-name: io.github.sidney/web-to-markdown-mcp -->
 
-An [MCP](https://modelcontextprotocol.io) server that fetches a URL through a real Chromium browser and returns the main content as clean Markdown.
+An [MCP](https://modelcontextprotocol.io) server that fetches a URL and returns the main content as clean Markdown. Uses plain HTTP when possible and real Chromium when needed.
 
 ## Why
 
@@ -10,15 +10,17 @@ Most MCP web-fetch tools either:
 - use plain HTTP, which fails on JS-required pages and gets blocked by Cloudflare bot detection on many sites; or
 - use a real browser but return raw HTML or accessibility-tree snapshots, which are noisy and token-heavy when you just want to read the article.
 
-This server uses a two-tier approach:
+This server uses a three-tier strategy, using the fastest approach that works for each URL:
 
-1. **Native markdown fast-path.** Every request first tries a plain HTTP GET with an `Accept: text/markdown` header. Servers that support content negotiation — such as Cloudflare-hosted sites with [Markdown for Agents](https://developers.cloudflare.com/fundamentals/reference/markdown-for-agents/) enabled — respond with `Content-Type: text/markdown`, and the body is returned immediately with no browser overhead. Servers that don't recognise the header respond normally and fall through to tier 2.
+1. **Native markdown fast-path.** Every request first tries a plain HTTP GET with an `Accept: text/markdown` header. Servers that support content negotiation — such as Cloudflare-hosted sites with [Markdown for Agents](https://developers.cloudflare.com/fundamentals/reference/markdown-for-agents/) enabled — respond with `Content-Type: text/markdown`, and the body is returned immediately with no browser overhead.
 
-2. **Browser fallback.** When the fast-path doesn't yield markdown, [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) drives real Chromium, and [trafilatura](https://trafilatura.readthedocs.io) strips navigation, sidebars, ads, and footers down to the article body as clean Markdown.
+2. **Plain HTTP + extraction.** If the server returns HTML, [trafilatura](https://trafilatura.readthedocs.io) extracts the article body as clean Markdown directly from the static response. Heuristics detect JS shells — pages that return only a "JavaScript required" stub in the static HTML — and fall through to tier 3 for those.
 
-After navigation, the server polls the DOM and runs trafilatura, returning as soon as two consecutive polls produce the same extraction. This means it returns within a few hundred milliseconds for typical pages — rather than waiting for analytics, ads, and other late-loading resources to finish — and gives slow SPAs and bot-challenge clearance time to settle without timing out prematurely.
+3. **Headless browser.** When tiers 1 and 2 yield nothing usable, [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) drives real Chromium and trafilatura extracts the rendered content. A single headless browser instance is kept alive across calls — it launches lazily on the first browser-tier fetch and stays running for the session, so subsequent fetches pay only navigation time rather than Chromium startup cost (~2–5 s).
 
-Headless mode is the default and works on standard pages. For sites with active bot detection (Cloudflare challenges and similar), pass `headless=False` to use a visible Chromium window — slower and visually intrusive, but clears most challenges that block headless mode.
+For sites that block even headless patchright (aggressive bot detection), pass `headless=False`. This uses a visible Chromium window — slower and visually intrusive, but clears most remaining challenges. A headed browser is launched and closed for each fetch that needs it; it is not kept persistent since headed fetches are an infrequent escape hatch rather than the common case.
+
+After browser navigation, the server polls the DOM and runs trafilatura, returning as soon as two consecutive polls produce the same extraction. This means it returns within a few hundred milliseconds for typical pages — rather than waiting for analytics, ads, and other late-loading resources to finish — and gives slow SPAs and bot-challenge clearance time to settle without timing out prematurely.
 
 For a typical article, expect roughly 80% fewer tokens than the raw HTML and roughly 90% fewer than a full accessibility-tree snapshot.
 
@@ -107,7 +109,7 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 
 ## Limitations
 
-- **Cold start.** Each call launches a fresh Chromium (~1–2 s overhead). A persistent browser instance is on the v2 roadmap.
+- **First browser-tier fetch per session.** The headless browser launches lazily on the first fetch that needs it (~2–5 s). Subsequent browser-tier fetches in the same session reuse the running instance and pay only navigation time.
 - **Bot detection on hard sites.** patchright headless clears default Cloudflare configurations on many sites, but pages running aggressive Bot Fight Mode, Turnstile interactive challenges, or commercial bot-management products (PerimeterX, DataDome, Kasada) — and Cloudflare's own marketing site — still detect headless Chromium. Pass `headless=False` to use a visible browser window, which clears most of these. The cost is a Chromium window flashing on screen for a couple of seconds per fetch.
 - **Headed-mode bot challenges need a generous polling budget.** When using `headless=False` on bot-protected sites, the challenge can take 5-15 seconds to clear. Set `poll_budget_ms` to 10000-15000 for these cases — the 5000 default may return prematurely while the challenge is still resolving.
 - **Headed mode requires a display.** `headless=False` fails on servers without a graphical environment (cloud VMs, containers, CI). Use a virtual display like Xvfb if you need headed mode in those environments.
@@ -118,12 +120,12 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 ## Comparison with related tools
 
 - **[`@playwright/mcp`](https://github.com/microsoft/playwright-mcp)** (Microsoft) — general-purpose interactive browser automation: navigate, click, fill forms, run JS, take accessibility snapshots. Use it when you need to *interact* with a page. Use this server when you need to *read* a page.
-- **`mcp-server-fetch`** and similar HTTP-based servers — faster and lighter, but get blocked by Cloudflare and don't render JS. Try those first for compliant sites; reach for this one when they fail.
+- **`mcp-server-fetch`** and similar HTTP-based servers — also try plain HTTP first, so for static sites the behaviour is similar. The difference is JS-rendered pages and bot-protected sites: those tools don't have a browser fallback, so they fail where this server succeeds.
 - **LM Studio Hub plugins** like `vadimfedenko/visit-website-reworked` and `npacker/web-tools` — same idea inside LM Studio's plugin system. This server runs in any MCP client.
 
 ## Roadmap
 
-- [ ] Persistent browser instance to amortize cold start
+- [x] Persistent headless browser instance to amortize cold start
 - [x] `Accept: text/markdown` fast path for [Cloudflare's Markdown for Agents](https://blog.cloudflare.com/introducing-markdown-for-agents/)
 - [ ] Optional `selector` parameter to scope extraction
 - [ ] Optional viewport, user-agent, and locale overrides
