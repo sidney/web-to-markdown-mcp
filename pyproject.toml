@@ -42,6 +42,17 @@ Homepage = "https://github.com/sidney/web-to-markdown-mcp"
 Repository = "https://github.com/sidney/web-to-markdown-mcp"
 Issues = "https://github.com/sidney/web-to-markdown-mcp/issues"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
