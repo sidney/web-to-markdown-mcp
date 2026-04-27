@@ -64,6 +64,18 @@ async def test_returns_none_for_js_shell_with_sparse_extraction():
     assert result is None
 
 
+async def test_returns_none_for_small_js_shell_with_javascript_stub():
+    """Tiny HTML with a 'enable JavaScript' stub falls through to browser regardless of raw size."""
+    stub_text = "You need to enable JavaScript to run this app."
+    small_html = f"<html><body><div id='root'><p>{stub_text}</p></div></body></html>"
+    with respx.mock:
+        respx.get("https://example.com/").mock(
+            return_value=httpx.Response(200, text=small_html, headers={"content-type": "text/html"})
+        )
+        result = await _try_http("https://example.com/")
+    assert result is None
+
+
 async def test_returns_short_extraction_from_small_html():
     """Short extracted content from small HTML (e.g. example.com) is kept, not discarded."""
     short_html = "<html><body><p>" + "Real content. " * 5 + "</p></body></html>"

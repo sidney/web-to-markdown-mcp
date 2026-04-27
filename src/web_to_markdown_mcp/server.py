@@ -218,8 +218,10 @@ async def _try_http(url: str) -> str | None:
             url=url,
         )
         if md:
-            if len(md) < _MIN_EXTRACTED_CHARS and len(r.text) > _MIN_RAW_BYTES:
-                logger.debug("fast-path tier 2: sparse extraction, falling through to browser at %s", url)
+            js_stub = len(md) < _MIN_EXTRACTED_CHARS and "javascript" in md.lower()
+            sparse = len(md) < _MIN_EXTRACTED_CHARS and len(r.text) > _MIN_RAW_BYTES
+            if js_stub or sparse:
+                logger.debug("fast-path tier 2: JS shell detected, falling through to browser at %s", url)
             else:
                 logger.debug("fast-path tier 2: trafilatura extracted from plain HTTP at %s", url)
                 return md
