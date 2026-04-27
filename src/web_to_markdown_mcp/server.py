@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import httpx
 import trafilatura
 from fastmcp import FastMCP
 from patchright.async_api import (
+    Browser,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -22,12 +24,48 @@ from patchright.async_api import (
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("web-to-markdown")
-
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 
 _ACCEPT_HEADER = "text/markdown, text/html;q=0.9, */*;q=0.8"
 _FAST_PATH_TIMEOUT = 10.0
+
+_playwright_instance = None
+_headless_browser: Browser | None = None
+_browser_lock = asyncio.Lock()
+
+
+async def _get_headless_browser() -> Browser:
+    """Return the shared headless browser, launching it if needed or if it has crashed."""
+    global _playwright_instance, _headless_browser
+    async with _browser_lock:
+        if _headless_browser is None or not _headless_browser.is_connected():
+            if _playwright_instance is not None:
+                try:
+                    await _playwright_instance.stop()
+                except Exception:
+                    pass
+            _playwright_instance = await async_playwright().start()
+            _headless_browser = await _playwright_instance.chromium.launch(headless=True)
+    return _headless_browser
+
+
+@asynccontextmanager
+async def _lifespan(server: FastMCP):
+    yield
+    global _playwright_instance, _headless_browser
+    if _headless_browser is not None:
+        try:
+            await _headless_browser.close()
+        except Exception:
+            pass
+    if _playwright_instance is not None:
+        try:
+            await _playwright_instance.stop()
+        except Exception:
+            pass
+
+
+mcp = FastMCP("web-to-markdown", lifespan=_lifespan)
 
 
 @mcp.tool()
@@ -48,11 +86,13 @@ async def fetch_url_as_markdown(
 
     Otherwise, uses patchright (a Playwright fork with anti-detection
     patches) to drive real Chromium, which clears most Cloudflare bot
-    challenges and renders JavaScript-required pages. After navigation,
-    polls the page DOM and runs trafilatura, returning as soon as the
-    extracted Markdown stabilizes across two consecutive polls — typically
-    within a few hundred milliseconds of the DOM being built, regardless of
-    whether trackers, ads, and analytics are still loading in the background.
+    challenges and renders JavaScript-required pages. A single headless
+    Chromium instance is kept alive across calls so subsequent fetches
+    avoid the browser cold-start cost (~2-5s). After navigation, polls
+    the page DOM and runs trafilatura, returning as soon as the extracted
+    Markdown stabilizes across two consecutive polls — typically within a
+    few hundred milliseconds of the DOM being built, regardless of whether
+    trackers, ads, and analytics are still loading in the background.
 
     Args:
         url: The URL to fetch.
@@ -95,17 +135,9 @@ async def fetch_url_as_markdown(
         return md
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
-            try:
-                context = await browser.new_context()
-                page = await context.new_page()
-                await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-                md = await _poll_until_stable(
-                    page, url, poll_budget_ms, poll_interval_ms
-                )
-            finally:
-                await browser.close()
+        md = await _browser_fetch(
+            url, wait_until, timeout_ms, headless, poll_budget_ms, poll_interval_ms
+        )
     except PlaywrightTimeoutError:
         return f"ERROR: navigation to {url} timed out after {timeout_ms}ms"
     except Exception as exc:
@@ -114,6 +146,35 @@ async def fetch_url_as_markdown(
     if not md:
         return f"ERROR: no extractable content found at {url}"
     return md
+
+
+async def _browser_fetch(
+    url: str,
+    wait_until: WaitUntil,
+    timeout_ms: int,
+    headless: bool,
+    poll_budget_ms: int,
+    poll_interval_ms: int,
+) -> str | None:
+    if headless:
+        browser = await _get_headless_browser()
+        context = await browser.new_context()
+        try:
+            page = await context.new_page()
+            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            return await _poll_until_stable(page, url, poll_budget_ms, poll_interval_ms)
+        finally:
+            await context.close()
+    else:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                return await _poll_until_stable(page, url, poll_budget_ms, poll_interval_ms)
+            finally:
+                await browser.close()
 
 
 async def _try_native_markdown(url: str) -> str | None:
