@@ -30,6 +30,11 @@ WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 
 _ACCEPT_HEADER = "text/markdown, text/html;q=0.9, */*;q=0.8"
 _FAST_PATH_TIMEOUT = 10.0
+# Tier-2 heuristic: if trafilatura yields fewer than this many characters from
+# an HTML response larger than _MIN_RAW_BYTES, the page is likely a JS shell
+# whose real content requires a browser to render.
+_MIN_EXTRACTED_CHARS = 200
+_MIN_RAW_BYTES = 5000
 
 _playwright_instance = None
 _headless_browser: Browser | None = None
@@ -213,8 +218,11 @@ async def _try_http(url: str) -> str | None:
             url=url,
         )
         if md:
-            logger.debug("fast-path tier 2: trafilatura extracted from plain HTTP at %s", url)
-            return md
+            if len(md) < _MIN_EXTRACTED_CHARS and len(r.text) > _MIN_RAW_BYTES:
+                logger.debug("fast-path tier 2: sparse extraction, falling through to browser at %s", url)
+            else:
+                logger.debug("fast-path tier 2: trafilatura extracted from plain HTTP at %s", url)
+                return md
     except Exception:
         pass
     return None
