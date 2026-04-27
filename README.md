@@ -9,7 +9,11 @@ Most MCP web-fetch tools either:
 - use plain HTTP, which fails on JS-required pages and gets blocked by Cloudflare bot detection on many sites; or
 - use a real browser but return raw HTML or accessibility-tree snapshots, which are noisy and token-heavy when you just want to read the article.
 
-This server uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) to drive real Chromium, and [trafilatura](https://trafilatura.readthedocs.io) to strip navigation, sidebars, ads, and footers down to the article body, returning clean Markdown.
+This server uses a two-tier approach:
+
+1. **Native markdown fast-path.** Every request first tries a plain HTTP GET with an `Accept: text/markdown` header. Servers that support content negotiation — such as Cloudflare-hosted sites with [Markdown for Agents](https://developers.cloudflare.com/fundamentals/reference/markdown-for-agents/) enabled — respond with `Content-Type: text/markdown`, and the body is returned immediately with no browser overhead. Servers that don't recognise the header respond normally and fall through to tier 2.
+
+2. **Browser fallback.** When the fast-path doesn't yield markdown, [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) (a Playwright fork with anti-detection patches) drives real Chromium, and [trafilatura](https://trafilatura.readthedocs.io) strips navigation, sidebars, ads, and footers down to the article body as clean Markdown.
 
 After navigation, the server polls the DOM and runs trafilatura, returning as soon as two consecutive polls produce the same extraction. This means it returns within a few hundred milliseconds for typical pages — rather than waiting for analytics, ads, and other late-loading resources to finish — and gives slow SPAs and bot-challenge clearance time to settle without timing out prematurely.
 
@@ -119,7 +123,7 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 ## Roadmap
 
 - [ ] Persistent browser instance to amortize cold start
-- [ ] `Accept: text/markdown` fast path for [Cloudflare's Markdown for Agents](https://blog.cloudflare.com/introducing-markdown-for-agents/)
+- [x] `Accept: text/markdown` fast path for [Cloudflare's Markdown for Agents](https://blog.cloudflare.com/introducing-markdown-for-agents/)
 - [ ] Optional `selector` parameter to scope extraction
 - [ ] Optional viewport, user-agent, and locale overrides
 - [ ] Optional persistent browser context for sticky cookies / WAF trust

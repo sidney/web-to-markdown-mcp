@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Literal
 
+import httpx
 import trafilatura
 from fastmcp import FastMCP
 from patchright.async_api import (
@@ -25,6 +26,9 @@ mcp = FastMCP("playwright-markdown")
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 
+_ACCEPT_HEADER = "text/markdown, text/html;q=0.9, */*;q=0.8"
+_FAST_PATH_TIMEOUT = 10.0
+
 
 @mcp.tool()
 async def fetch_url_as_markdown(
@@ -35,15 +39,20 @@ async def fetch_url_as_markdown(
     poll_budget_ms: int = 5000,
     poll_interval_ms: int = 250,
 ) -> str:
-    """Fetch a URL through Chromium and return the main content as Markdown.
+    """Fetch a URL and return the main content as Markdown.
 
-    Uses patchright (a Playwright fork with anti-detection patches) to drive
-    real Chromium, which clears most Cloudflare bot challenges and renders
-    JavaScript-required pages. After navigation, polls the page DOM and
-    runs trafilatura, returning as soon as the extracted Markdown stabilizes
-    across two consecutive polls — typically within a few hundred
-    milliseconds of the DOM being built, regardless of whether trackers,
-    ads, and analytics are still loading in the background.
+    First tries a plain HTTP request with an Accept: text/markdown header.
+    If the server responds with Content-Type: text/markdown (e.g. Cloudflare
+    Markdown for Agents sites), the body is returned immediately without
+    launching a browser.
+
+    Otherwise, uses patchright (a Playwright fork with anti-detection
+    patches) to drive real Chromium, which clears most Cloudflare bot
+    challenges and renders JavaScript-required pages. After navigation,
+    polls the page DOM and runs trafilatura, returning as soon as the
+    extracted Markdown stabilizes across two consecutive polls — typically
+    within a few hundred milliseconds of the DOM being built, regardless of
+    whether trackers, ads, and analytics are still loading in the background.
 
     Args:
         url: The URL to fetch.
@@ -81,6 +90,10 @@ async def fetch_url_as_markdown(
         "ERROR:" if the fetch or extraction fails in an expected way
         (timeout, no extractable content, etc.).
     """
+    md = await _try_native_markdown(url)
+    if md is not None:
+        return md
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
@@ -101,6 +114,33 @@ async def fetch_url_as_markdown(
     if not md:
         return f"ERROR: no extractable content found at {url}"
     return md
+
+
+async def _try_native_markdown(url: str) -> str | None:
+    """Return the body if the server responds with Content-Type: text/markdown, else None.
+
+    Sends an Accept header advertising markdown preference. Servers that
+    don't support content negotiation ignore it and respond normally, so
+    this is fully backwards-compatible. Any error silently falls through to
+    the browser pipeline.
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            r = await client.get(
+                url,
+                headers={"Accept": _ACCEPT_HEADER},
+                timeout=_FAST_PATH_TIMEOUT,
+            )
+        if (
+            r.is_success
+            and r.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            == "text/markdown"
+        ):
+            logger.debug("fast-path: native markdown from %s", url)
+            return r.text
+    except Exception:
+        pass
+    return None
 
 
 async def _poll_until_stable(
