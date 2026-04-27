@@ -1,4 +1,5 @@
 # web-to-markdown-mcp
+<!-- mcp-name: io.github.sidney/web-to-markdown-mcp -->
 
 An [MCP](https://modelcontextprotocol.io) server that fetches a URL through a real Chromium browser and returns the main content as clean Markdown.
 
