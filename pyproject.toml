@@ -1,6 +1,6 @@
 [project]
 name = "web-to-markdown-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "MCP server that fetches URLs and returns clean Markdown, with Cloudflare fast-path and Chromium fallback"
 readme = "README.md"
 license = { text = "MIT" }
