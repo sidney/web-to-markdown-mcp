@@ -21,7 +21,7 @@ def _browser_mock(page_mock=None):
 
 async def test_fast_path_skips_browser():
     """When native markdown is available, the browser is never called."""
-    with patch("web_to_markdown_mcp.server._try_native_markdown", return_value="# Native"):
+    with patch("web_to_markdown_mcp.server._try_http", return_value="# Native"):
         with patch("web_to_markdown_mcp.server._get_headless_browser") as mock_browser:
             result = await fetch_url_as_markdown("https://example.com/")
 
@@ -33,7 +33,7 @@ async def test_falls_back_to_browser_and_returns_polled_content():
     """Fast-path miss triggers browser fetch; poll result is returned."""
     browser, _ = _browser_mock()
 
-    with patch("web_to_markdown_mcp.server._try_native_markdown", return_value=None):
+    with patch("web_to_markdown_mcp.server._try_http", return_value=None):
         with patch("web_to_markdown_mcp.server._get_headless_browser", new=AsyncMock(return_value=browser)):
             with patch("web_to_markdown_mcp.server._poll_until_stable", return_value="# Browser"):
                 result = await fetch_url_as_markdown("https://example.com/")
@@ -47,7 +47,7 @@ async def test_returns_error_on_navigation_timeout():
     page.goto.side_effect = PlaywrightTimeoutError("navigation timed out")
     browser, _ = _browser_mock(page_mock=page)
 
-    with patch("web_to_markdown_mcp.server._try_native_markdown", return_value=None):
+    with patch("web_to_markdown_mcp.server._try_http", return_value=None):
         with patch("web_to_markdown_mcp.server._get_headless_browser", new=AsyncMock(return_value=browser)):
             result = await fetch_url_as_markdown("https://example.com/", timeout_ms=30000)
 
@@ -62,7 +62,7 @@ async def test_returns_error_on_unexpected_exception():
     page.goto.side_effect = RuntimeError("something broke")
     browser, _ = _browser_mock(page_mock=page)
 
-    with patch("web_to_markdown_mcp.server._try_native_markdown", return_value=None):
+    with patch("web_to_markdown_mcp.server._try_http", return_value=None):
         with patch("web_to_markdown_mcp.server._get_headless_browser", new=AsyncMock(return_value=browser)):
             result = await fetch_url_as_markdown("https://example.com/")
 
@@ -74,7 +74,7 @@ async def test_returns_error_when_no_extractable_content():
     """When polling yields nothing, returns an ERROR string mentioning the URL."""
     browser, _ = _browser_mock()
 
-    with patch("web_to_markdown_mcp.server._try_native_markdown", return_value=None):
+    with patch("web_to_markdown_mcp.server._try_http", return_value=None):
         with patch("web_to_markdown_mcp.server._get_headless_browser", new=AsyncMock(return_value=browser)):
             with patch("web_to_markdown_mcp.server._poll_until_stable", return_value=None):
                 result = await fetch_url_as_markdown("https://example.com/")

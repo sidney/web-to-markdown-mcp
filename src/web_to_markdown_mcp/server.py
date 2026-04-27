@@ -1,8 +1,10 @@
 """web-to-markdown-mcp server.
 
-Fetches URLs and returns the main content as clean Markdown. Tries an
-HTTP content-negotiation fast-path first (Accept: text/markdown); falls
-back to real Chromium via patchright for JS-heavy and bot-protected pages.
+Fetches URLs and returns the main content as clean Markdown. Uses a
+three-tier strategy: (1) Accept: text/markdown fast-path for servers that
+natively serve markdown; (2) plain HTTP + trafilatura for pages with
+static HTML content; (3) persistent headless Chromium for JS-heavy or
+bot-protected pages where tiers 1 and 2 yield nothing.
 """
 from __future__ import annotations
 
@@ -130,7 +132,7 @@ async def fetch_url_as_markdown(
         "ERROR:" if the fetch or extraction fails in an expected way
         (timeout, no extractable content, etc.).
     """
-    md = await _try_native_markdown(url)
+    md = await _try_http(url)
     if md is not None:
         return md
 
@@ -177,13 +179,18 @@ async def _browser_fetch(
                 await browser.close()
 
 
-async def _try_native_markdown(url: str) -> str | None:
-    """Return the body if the server responds with Content-Type: text/markdown, else None.
+async def _try_http(url: str) -> str | None:
+    """Attempt to satisfy the request without launching a browser.
 
-    Sends an Accept header advertising markdown preference. Servers that
-    don't support content negotiation ignore it and respond normally, so
-    this is fully backwards-compatible. Any error silently falls through to
-    the browser pipeline.
+    Tier 1: if the server responds with Content-Type: text/markdown, return
+    the body directly (Cloudflare Markdown for Agents and similar).
+
+    Tier 2: if the server returns HTML, try trafilatura on it. Pages with
+    static prose content (example.com, docs sites, blogs) yield clean
+    markdown here. JS-rendered pages return None from trafilatura and fall
+    through to the browser tier.
+
+    Any network error silently returns None so the browser tier is tried.
     """
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -192,13 +199,22 @@ async def _try_native_markdown(url: str) -> str | None:
                 headers={"Accept": _ACCEPT_HEADER},
                 timeout=_FAST_PATH_TIMEOUT,
             )
-        if (
-            r.is_success
-            and r.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            == "text/markdown"
-        ):
-            logger.debug("fast-path: native markdown from %s", url)
+        if not r.is_success:
+            return None
+        content_type = r.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type == "text/markdown":
+            logger.debug("fast-path tier 1: native markdown from %s", url)
             return r.text
+        md = trafilatura.extract(
+            r.text,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            url=url,
+        )
+        if md:
+            logger.debug("fast-path tier 2: trafilatura extracted from plain HTTP at %s", url)
+            return md
     except Exception:
         pass
     return None
