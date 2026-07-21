@@ -1,6 +1,6 @@
 [project]
 name = "web-to-markdown-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP server that fetches URLs and returns clean Markdown, with Cloudflare fast-path and Chromium fallback"
 readme = "README.md"
 license = { text = "MIT" }
@@ -32,10 +32,12 @@ dependencies = [
     "httpx>=0.27.0",
     "patchright>=1.40.0",
     "trafilatura>=1.12.0",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
 web-to-markdown-mcp = "web_to_markdown_mcp.server:main"
+web-to-markdown-http = "web_to_markdown_mcp.serve_http:main"
 
 [project.urls]
 Homepage = "https://github.com/sidney/web-to-markdown-mcp"

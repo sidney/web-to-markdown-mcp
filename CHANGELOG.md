@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.7.0 (2026-07-20)
+
+### Added
+- HTTP transport (`serve_http.py`, `web-to-markdown-http` entrypoint): serves the existing tool over streamable HTTP via uvicorn so remote clients (e.g. the mobile app) can reach it. Gated by a `?key=` query-string token (the only auth a headerless MCP client can carry), with keys read from a file and rotatable without restart, a per-IP rate limit, `key=` scrubbed from logs, and fail-closed on a missing key file. stdio behavior unchanged.
+- SSRF guard (`_ssrf.py`) enforced across all fetch tiers: tool input, every httpx redirect hop, and every browser request via `page.route`. Blocks non-http(s) schemes and hosts resolving to private/loopback/link-local/reserved addresses (including IPv4-mapped IPv6 and integer/hex IP literals). Short-TTL decision cache.
+- Browser-concurrency semaphore (`WTM_BROWSER_CONCURRENCY`, default 1): serializes headless Chromium to bound RAM/CPU; HTTP tiers stay concurrent.
+- `tests/test_ssrf.py` covering the guard; `docs/security.md` documenting the threat model, controls, tunables, and known residuals (DNS rebinding, octal obfuscation).
+
+### Changed
+- httpx fast-path now uses `follow_redirects=False` with a manual, per-hop guarded redirect loop.
+
 ## v0.6.0 (2026-04-28)
 
 ### Added

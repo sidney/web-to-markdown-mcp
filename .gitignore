@@ -43,6 +43,7 @@ coverage.xml
 env/
 venv/
 ENV/
+secrets/
 
 # uv
 uv.lock

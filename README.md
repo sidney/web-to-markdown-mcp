@@ -105,7 +105,7 @@ fetch_url_as_markdown(url="https://example.com/long-article")
 - `"networkidle"` — waits for network to quiet; sometimes hangs on pages with persistent background connections
 - `"commit"` — returns as soon as the response starts; rarely useful
 
-**When to bump `poll_budget_ms`:** the 5-second default is fine for typical pages but may return a partial extraction on slow SPAs that render content over many seconds, and may time out before a bot-detection challenge clears in headed mode. For headed-mode fetches of bot-protected sites, 10000-15000 is a reasonable budget.
+**When to bump `poll_budget_ms`:** the 5-second default is fine for typical pages but may return a partial extraction on slow SPAs that render content over many seconds, and may time out before a bot-detection challenge clears in headed mode. For headed-mode fetches of bot-protected sites, 10000-30000 is a reasonable budget.
 
 ## Limitations
 

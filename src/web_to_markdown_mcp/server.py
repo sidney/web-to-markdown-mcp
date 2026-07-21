@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 import trafilatura
@@ -24,17 +26,30 @@ from patchright.async_api import (
     async_playwright,
 )
 
+# Relative import: _ssrf.py must live in this package, next to server.py.
+# Running server.py as a loose script (rather than via the installed package)
+# breaks this import; use the package entrypoints (main / serve_http:main).
+# See docs/security.md, "Packaging & entrypoints".
+from ._ssrf import SSRFError, assert_url_allowed
+
 logger = logging.getLogger(__name__)
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 
 _ACCEPT_HEADER = "text/markdown, text/html;q=0.9, */*;q=0.8"
 _FAST_PATH_TIMEOUT = 10.0
+_MAX_REDIRECTS = 5
 # Tier-2 heuristic: if trafilatura yields fewer than this many characters from
 # an HTML response larger than _MIN_RAW_BYTES, the page is likely a JS shell
 # whose real content requires a browser to render.
 _MIN_EXTRACTED_CHARS = 200
 _MIN_RAW_BYTES = 5000
+
+# Serialize the browser tier. One headless page at a time bounds RAM and CPU
+# on the shared 2-vCPU box; tiers 1-2 (plain httpx) stay concurrent. Tunable
+# via env, but 1 is the intended default.
+_BROWSER_CONCURRENCY = int(os.environ.get("WTM_BROWSER_CONCURRENCY", "1"))
+_fetch_semaphore = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 
 _playwright_instance = None
 _headless_browser: Browser | None = None
@@ -54,6 +69,32 @@ async def _get_headless_browser() -> Browser:
             _playwright_instance = await async_playwright().start()
             _headless_browser = await _playwright_instance.chromium.launch(headless=True)
     return _headless_browser
+
+
+async def _guard_route(route) -> None:
+    """Abort any browser request whose target is a disallowed address.
+
+    Installed on every page so it guards not just the top-level navigation
+    but browser-driven redirects and subresource requests too -- the vectors
+    the httpx guard can't see once Chromium is driving. Only http(s) requests
+    are vetted; data:, blob:, and about: are in-memory and pass through, so
+    inline images and blank frames still render.
+
+    Cost/tuning: "**/*" routes every subresource through Python, adding overhead
+    on a heavy tier-3 page (the DNS part is mitigated by the guard's decision
+    cache). If it bites on the 2-vCPU box, narrow the pattern to document /
+    navigation requests and accept that subresource requests -- whose response
+    bytes never reach the caller anyway -- go unguarded. See docs/security.md,
+    "Operational notes".
+    """
+    url = route.request.url
+    if urlsplit(url).scheme.lower() in ("http", "https"):
+        try:
+            await assert_url_allowed(url)
+        except SSRFError:
+            await route.abort()
+            return
+    await route.continue_()
 
 
 @asynccontextmanager
@@ -135,9 +176,19 @@ async def fetch_url_as_markdown(
     Returns:
         The page's main content as Markdown, or a string starting with
         "ERROR:" if the fetch or extraction fails in an expected way
-        (timeout, no extractable content, etc.).
+        (timeout, no extractable content, refused target, etc.).
     """
-    md = await _try_http(url)
+    # Gate on the target before any network activity. Redirect hops and
+    # browser subresources are re-checked deeper in each tier.
+    try:
+        await assert_url_allowed(url)
+    except SSRFError as exc:
+        return f"ERROR: refused to fetch {url}: {exc}"
+
+    try:
+        md = await _try_http(url)
+    except SSRFError as exc:
+        return f"ERROR: refused to fetch {url}: {exc}"
     if md is not None:
         return md
 
@@ -163,25 +214,55 @@ async def _browser_fetch(
     poll_budget_ms: int,
     poll_interval_ms: int,
 ) -> str | None:
-    if headless:
-        browser = await _get_headless_browser()
-        context = await browser.new_context()
-        try:
-            page = await context.new_page()
-            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
-            return await _poll_until_stable(page, url, poll_budget_ms, poll_interval_ms)
-        finally:
-            await context.close()
-    else:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+    # Semaphore bounds concurrent browser pages (default 1). Held across the
+    # whole page lifecycle so only that many Chromium contexts exist at once.
+    async with _fetch_semaphore:
+        if headless:
+            browser = await _get_headless_browser()
+            context = await browser.new_context()
             try:
-                context = await browser.new_context()
                 page = await context.new_page()
+                await page.route("**/*", _guard_route)
                 await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
                 return await _poll_until_stable(page, url, poll_budget_ms, poll_interval_ms)
             finally:
-                await browser.close()
+                await context.close()
+        else:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=False)
+                try:
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.route("**/*", _guard_route)
+                    await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                    return await _poll_until_stable(page, url, poll_budget_ms, poll_interval_ms)
+                finally:
+                    await browser.close()
+
+
+async def _guarded_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """GET with manual, SSRF-guarded redirect following.
+
+    The client is configured with follow_redirects=False so no hop is taken
+    without vetting. Every hop (including the first) is checked against the
+    SSRF guard before the request goes out; a redirect to a disallowed
+    address raises SSRFError rather than being followed. httpx still resolves
+    the Location into an absolute URL on next_request, so relative redirects
+    are handled correctly.
+    """
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        await assert_url_allowed(current)
+        r = await client.get(
+            current,
+            headers={"Accept": _ACCEPT_HEADER},
+            timeout=_FAST_PATH_TIMEOUT,
+        )
+        if r.is_redirect and r.has_redirect_location:
+            current = str(r.next_request.url)
+            continue
+        return r
+    raise SSRFError(f"too many redirects following {url}")
 
 
 async def _try_http(url: str) -> str | None:
@@ -195,15 +276,14 @@ async def _try_http(url: str) -> str | None:
     markdown here. JS-rendered pages return None from trafilatura and fall
     through to the browser tier.
 
-    Any network error silently returns None so the browser tier is tried.
+    Redirects are followed manually so each hop is SSRF-checked; a blocked
+    hop raises SSRFError (surfaced to the caller as a refusal) rather than
+    silently falling through. Any other network error returns None so the
+    browser tier is tried.
     """
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            r = await client.get(
-                url,
-                headers={"Accept": _ACCEPT_HEADER},
-                timeout=_FAST_PATH_TIMEOUT,
-            )
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            r = await _guarded_get(client, url)
         if not r.is_success:
             return None
         content_type = r.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -225,6 +305,8 @@ async def _try_http(url: str) -> str | None:
             else:
                 logger.debug("fast-path tier 2: trafilatura extracted from plain HTTP at %s", url)
                 return md
+    except SSRFError:
+        raise
     except Exception:
         pass
     return None
