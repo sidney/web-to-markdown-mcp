@@ -16,12 +16,29 @@
 # is large, or a background actor could plausibly have fired inside it, run
 # it again before believing the picture.
 #
-# Requires root: reads iptables and runs a probe as the fetcher uid. It
+# Requires root: reads iptables and runs probes as the fetcher uid. It
 # refuses to run unprivileged rather than emit a partial snapshot, because a
 # partial snapshot is the exact failure mode this script exists to prevent.
 #
 # Exit status is 0 whenever the snapshot was taken, regardless of what it
 # found. Do not gate anything on it. Read the SUMMARY.
+#
+# ---------------------------------------------------------------------------
+# ON THE EXPECTED FAILURE MODE WITH THE TUNNEL DOWN (verified 2026-07-24)
+#
+# The fetcher's fail-closed error is EINVAL (errno 22), NOT ENETUNREACH.
+# The kernel maps RTN_BLACKHOLE to -EINVAL, so a lookup that reaches the vpn
+# table and matches the blackhole default returns "Invalid argument" at
+# connect() time. curl renders that as the generic "Couldn't connect to
+# server", while still reporting its own "after 1 ms" timing.
+#
+# These two are NOT interchangeable and the difference is diagnostic:
+#   EINVAL       -> blackhole present and governing. Correct fail-closed.
+#   ENETUNREACH  -> vpn table has NO route at all. Also fails closed, but by
+#                   accident rather than by design; the blackhole is missing.
+# Anything downstream that classifies egress errors must not key on
+# ENETUNREACH alone.
+# ---------------------------------------------------------------------------
 
 set -u
 export LC_ALL=C   # EPOCHREALTIME decimal separator, and stable ip/iptables output
@@ -37,8 +54,9 @@ MAIN_GW="${WTM_MAIN_GW:-10.0.0.1}"
 MAIN_IF="${WTM_MAIN_IF:-enp0s6}"
 SONIC_PREFIX="${WTM_SONIC_PREFIX:-192.184.}"   # observed pool range, not authoritative
 PROBE_URL="${WTM_PROBE_URL:-https://api.ipify.org}"
-PROBE_TARGET="${WTM_PROBE_TARGET:-1.1.1.1}"    # for `ip route get`, no packets sent
+PROBE_TARGET="${WTM_PROBE_TARGET:-1.1.1.1}"
 PROBE_TIMEOUT="${WTM_PROBE_TIMEOUT:-15}"
+CONTROL_UID="${WTM_CONTROL_UID:-12345}"        # a uid no ip rule matches
 
 # --------------------------------------------------------------- helpers ---
 FAILS=0
@@ -46,11 +64,16 @@ UNKNOWNS=0
 
 section() { printf '\n=== %s ===\n' "$*"; }
 
-run() {   # display-only: echo the command, print its output indented
+# Display-only. Capture the status into a variable IMMEDIATELY: `[` is itself
+# a command and running it resets PIPESTATUS, so testing the array and then
+# re-expanding it in printf reports the status of the test, not of the
+# command. That bug made failing commands report "exited 0".
+run() {
     printf '$ %s\n' "$*"
     "$@" 2>&1 | sed 's/^/  /'
-    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-        printf '  (command exited %s)\n' "${PIPESTATUS[0]}"
+    local rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then
+        printf '  (command exited %s)\n' "$rc"
     fi
 }
 
@@ -66,9 +89,6 @@ ck() {    # ck ok|fail|unknown <label> [detail...]
     printf '  %s %-44s %s\n' "$mark" "$label" "$*"
 }
 
-# timed_probe <label> <command...>
-# Sets PROBE_OUT, PROBE_RC, PROBE_MS. Wall-clock timed so that a fast
-# connect-time failure is measured as such, not just reported as an error.
 PROBE_OUT=''; PROBE_RC=0; PROBE_MS=0
 timed_probe() {
     local label=$1
@@ -83,6 +103,20 @@ timed_probe() {
         "$label" "$PROBE_RC" "$PROBE_MS" "$(printf '%s' "$PROBE_OUT" | tr '\n' ' ')"
 }
 
+# Reports the raw errno of a connect() attempt, rather than leaving the
+# failure to be inferred from a client's prose. This is the authoritative
+# fail-closed signal; the curl probe below exists to report the exit IP.
+ERRNO_PROBE_PY='
+import errno, socket, sys
+s = socket.socket()
+s.settimeout(5)
+try:
+    s.connect((sys.argv[1], 443))
+    print("OK connected")
+except OSError as e:
+    print("ERR", e.errno, errno.errorcode.get(e.errno, "UNKNOWN"), "-", e.strerror)
+'
+
 # ------------------------------------------------------------ preflight ---
 if [ -z "${EPOCHREALTIME:-}" ]; then
     echo "wtm-egress-check: needs bash 5.0+ (EPOCHREALTIME)." >&2
@@ -90,7 +124,7 @@ if [ -z "${EPOCHREALTIME:-}" ]; then
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "wtm-egress-check: must run as root (iptables reads + fetcher probe)." >&2
+    echo "wtm-egress-check: must run as root (iptables reads + fetcher probes)." >&2
     echo "  try: sudo wtm-egress-check" >&2
     exit 2
 fi
@@ -103,7 +137,6 @@ printf ' wtm-egress-check   started %s\n' "$STARTED_AT"
 printf ' host %s   read-only snapshot, changes nothing\n' "$(hostname)"
 printf '===============================================================\n'
 
-# Resolve the fetcher uid up front; several checks key off it.
 if FETCHER_UID=$(id -u "$FETCHER_USER" 2>/dev/null); then
     printf '\nfetcher user: %s  uid %s\n' "$FETCHER_USER" "$FETCHER_UID"
 else
@@ -111,9 +144,9 @@ else
     printf '\nfetcher user: %s  NOT FOUND\n' "$FETCHER_USER"
 fi
 
-# Detect tunnel state once, from the route rather than from tun0 or from unit
-# status. The route is what decides whether packets go anywhere; `Type=notify`
-# reports ready roughly six seconds before the tunnel actually carries traffic.
+# Detect tunnel state from the route rather than from tun0 or unit status.
+# The route is what decides whether packets go anywhere; Type=notify reports
+# ready roughly six seconds before the tunnel actually carries traffic.
 VPN_ROUTES=$(ip route show table "$VPN_TABLE" 2>&1)
 if printf '%s\n' "$VPN_ROUTES" | grep -qE '^default .*dev tun[0-9]'; then
     MODE=UP
@@ -136,29 +169,48 @@ printf '\n'
 printf '# connect()-time lookup as the kernel would do it for each identity.\n'
 printf '# This is the check the fwmark design failed: a mangle OUTPUT mark is\n'
 printf '# applied per packet, after the source address is already chosen.\n'
+printf '# With the tunnel DOWN, uid %s is EXPECTED to give "Invalid argument"\n' "${FETCHER_UID:-?}"
+printf '# — that is the blackhole answering (RTN_BLACKHOLE -> -EINVAL), not a\n'
+printf '# rejected command. The uid %s control below proves the distinction.\n' "$CONTROL_UID"
+
+CONTROL_GET=''
+UID_GET=''
 if [ -n "$FETCHER_UID" ]; then
+    UID_GET=$(ip route get "$PROBE_TARGET" uid "$FETCHER_UID" 2>&1)
     run ip route get "$PROBE_TARGET" uid "$FETCHER_UID"
 fi
+CONTROL_GET=$(ip route get "$PROBE_TARGET" uid "$CONTROL_UID" 2>&1)
+run ip route get "$PROBE_TARGET" uid "$CONTROL_UID"
 run ip route get "$PROBE_TARGET" uid 0
 
 # --------------------------------------------------------------- C: units --
 section "C. systemd units"
+OPENVPN_AGO=-1
 for unit in "$ROUTING_UNIT" "$OPENVPN_UNIT"; do
     active=$(systemctl is-active "$unit" 2>&1)
     enabled=$(systemctl is-enabled "$unit" 2>&1)
     entered=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null)
     ago='-'
+    ago_s=-1
     if [ -n "$entered" ]; then
         if entered_epoch=$(date -d "$entered" +%s 2>/dev/null); then
-            ago="$(( $(date +%s) - entered_epoch ))s ago"
+            ago_s=$(( $(date +%s) - entered_epoch ))
+            ago="${ago_s}s ago"
         fi
     fi
+    [ "$unit" = "$OPENVPN_UNIT" ] && OPENVPN_AGO=$ago_s
     printf '  %-26s active=%-12s enabled=%-12s entered=%s (%s)\n' \
         "$unit" "$active" "$enabled" "${entered:--}" "$ago"
 done
-printf '\n  NOTE: a very recent ActiveEnterTimestamp on %s means this\n' "$OPENVPN_UNIT"
-printf '  snapshot may sit inside the ~1-5s reconnect window in which the vpn\n'
-printf '  table holds only the blackhole and the fetcher correctly fails closed.\n'
+
+# Only warn about the reconnect window when there is actually a recent start
+# to straddle. Printing it unconditionally trains the reader to skip it.
+if [ "$OPENVPN_AGO" -ge 0 ] && [ "$OPENVPN_AGO" -lt 30 ]; then
+    printf '\n  WARNING: %s entered active %ss ago. This snapshot may sit\n' \
+        "$OPENVPN_UNIT" "$OPENVPN_AGO"
+    printf '  inside the ~1-5s reconnect window in which the vpn table holds only\n'
+    printf '  the blackhole and the fetcher correctly fails closed. Re-run.\n'
+fi
 
 # --------------------------------------------------------------- D: link ---
 section "D. tun0"
@@ -166,8 +218,8 @@ run ip -br link show tun0
 run ip -4 -br addr show tun0
 
 # Find the token after "inet" rather than a fixed field number: `ip -o addr`
-# prefixes an index, `ip -br addr` does not, and a net30-topology tun0 renders
-# as "inet A peer B/32" while subnet topology renders as "inet A/22".
+# prefixes a device index, `ip -br addr` does not, and a net30-topology tun0
+# renders as "inet A peer B/32" while subnet topology renders as "inet A/22".
 TUN_ADDR=$(ip -4 -o addr show dev tun0 2>/dev/null \
     | awk '{for (i = 1; i < NF; i++) if ($i == "inet") {print $(i+1); exit}}' \
     | cut -d/ -f1)
@@ -178,21 +230,33 @@ run iptables -t mangle -S OUTPUT
 run ip6tables -S OUTPUT
 
 # -------------------------------------------------------------- F: probes --
-section "F. live exit-IP probes ($PROBE_URL, --max-time ${PROBE_TIMEOUT}s)"
+section "F. probes"
 printf '  DNS resolves OUTSIDE the tunnel by design (loopback stub, priority-0\n'
-printf '  local table). So with the tunnel down the hostname still resolves and\n'
-printf '  the failure appears at connect, as ENETUNREACH in about 1ms.\n\n'
+printf '  local table). So with the tunnel down a hostname still resolves and the\n'
+printf '  failure appears at connect, as EINVAL from the blackhole in about 1ms.\n\n'
+
+ERRNO_NAME=''
+if [ -n "$FETCHER_UID" ] && command -v python3 >/dev/null 2>&1; then
+    timed_probe "connect() as $FETCHER_USER" \
+        sudo -u "$FETCHER_USER" python3 -c "$ERRNO_PROBE_PY" "$PROBE_TARGET"
+    ERRNO_OUT=$PROBE_OUT
+    ERRNO_NAME=$(printf '%s\n' "$ERRNO_OUT" | awk '$1 == "ERR" {print $3; exit}')
+    printf '%s\n' "$ERRNO_OUT" | grep -q '^OK connected' && ERRNO_NAME=CONNECTED
+else
+    ERRNO_OUT=''
+    printf '  connect() as %s        SKIPPED (no user, or python3 absent)\n' "$FETCHER_USER"
+fi
 
 if [ -n "$FETCHER_UID" ]; then
-    timed_probe "as $FETCHER_USER" \
+    timed_probe "curl as $FETCHER_USER" \
         sudo -u "$FETCHER_USER" curl -sS --max-time "$PROBE_TIMEOUT" "$PROBE_URL"
     FETCHER_OUT=$PROBE_OUT; FETCHER_RC=$PROBE_RC; FETCHER_MS=$PROBE_MS
 else
     FETCHER_OUT=''; FETCHER_RC=-1; FETCHER_MS=0
-    printf '  as %s                    SKIPPED (user not found)\n' "$FETCHER_USER"
+    printf '  curl as %s             SKIPPED (user not found)\n' "$FETCHER_USER"
 fi
 
-timed_probe "as root" curl -sS --max-time "$PROBE_TIMEOUT" "$PROBE_URL"
+timed_probe "curl as root" curl -sS --max-time "$PROBE_TIMEOUT" "$PROBE_URL"
 ROOT_OUT=$PROBE_OUT; ROOT_RC=$PROBE_RC
 
 # ------------------------------------------------------------- G: summary --
@@ -274,6 +338,18 @@ else
     ck fail "root exits Oracle IP" "got '$ROOT_OUT', expected $ORACLE_EXIT_IP"
 fi
 
+# The control makes the uid route-get self-validating: without it, an
+# "Invalid argument" on the fetcher uid is ambiguous between "the blackhole
+# answered" and "this iproute2 does not accept uid for route get".
+CONTROL_OK=no
+if printf '%s\n' "$CONTROL_GET" | grep -q "dev ${MAIN_IF}"; then
+    CONTROL_OK=yes
+    ck ok "route-get uid control (uid $CONTROL_UID)" "selector supported, falls to main table"
+else
+    ck unknown "route-get uid control (uid $CONTROL_UID)" \
+       "unexpected: $CONTROL_GET — treat uid route-get results as unreliable"
+fi
+
 if [ "$MODE" = UP ]; then
     printf '\n  Tunnel UP expectations:\n'
 
@@ -289,6 +365,20 @@ if [ "$MODE" = UP ]; then
         ck fail "tun0 has an address" "route says up but no v4 address"
     fi
 
+    if [ "$CONTROL_OK" = yes ]; then
+        if printf '%s\n' "$UID_GET" | grep -q 'dev tun[0-9]'; then
+            ck ok "route-get uid $FETCHER_UID -> tunnel"
+        else
+            ck fail "route-get uid $FETCHER_UID -> tunnel" "got: $UID_GET"
+        fi
+    fi
+
+    case "$ERRNO_NAME" in
+        CONNECTED) ck ok "connect() as $FETCHER_USER succeeds" ;;
+        '')        ck unknown "connect() as $FETCHER_USER" "probe skipped" ;;
+        *)         ck fail "connect() as $FETCHER_USER succeeds" "$ERRNO_OUT" ;;
+    esac
+
     case "$FETCHER_OUT" in
         "${SONIC_PREFIX}"*)
             ck ok "fetcher exits VPN IP" "$FETCHER_OUT (${FETCHER_MS}ms)" ;;
@@ -302,7 +392,7 @@ if [ "$MODE" = UP ]; then
 
     # Sonic assigns a public address straight to tun0 with no NAT, so the
     # observed exit address should equal tun0's own address. A mismatch means
-    # something is translating, or the probe left by a path you did not expect.
+    # something is translating, or the probe left by an unexpected path.
     if [ -n "$TUN_ADDR" ] && [ -n "$FETCHER_OUT" ]; then
         if [ "$TUN_ADDR" = "$FETCHER_OUT" ]; then
             ck ok "exit IP == tun0 address" "no NAT, as expected"
@@ -321,32 +411,46 @@ else
         ck ok "vpn table: no tunnel default" "blackhole governs"
     fi
 
-    # Two different numbers, do not conflate them. FETCHER_MS is wall clock
-    # around `sudo -u fetcher curl`, so it carries sudo and curl startup —
-    # tens of milliseconds even on an instant failure. The ~1ms datum is
-    # curl's OWN connect timing, which it reports inside its error message
-    # ("after 1 ms"). That one is the evidence that the blackhole was
-    # consulted at connect() rather than the packets being silently dropped.
+    if [ "$CONTROL_OK" = yes ]; then
+        if printf '%s\n' "$UID_GET" | grep -q 'Invalid argument'; then
+            ck ok "route-get uid $FETCHER_UID -> blackhole" "EINVAL, as designed"
+        elif printf '%s\n' "$UID_GET" | grep -q "dev ${MAIN_IF}"; then
+            ck fail "route-get uid $FETCHER_UID -> blackhole" \
+               "fetcher would route out the datacenter IP — LEAK"
+        else
+            ck unknown "route-get uid $FETCHER_UID -> blackhole" "got: $UID_GET"
+        fi
+    fi
+
+    # errno is authoritative here. curl's prose is not: it renders EINVAL as
+    # the generic "Couldn't connect to server".
     CURL_CONNECT_MS=$(printf '%s\n' "$FETCHER_OUT" \
         | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p' | head -n1)
 
+    case "$ERRNO_NAME" in
+        EINVAL)
+            if [ -n "$CURL_CONNECT_MS" ] && [ "$CURL_CONNECT_MS" -lt 50 ]; then
+                ck ok "fetcher fails closed at blackhole" \
+                   "EINVAL, curl connect ${CURL_CONNECT_MS}ms"
+            else
+                ck ok "fetcher fails closed at blackhole" \
+                   "EINVAL (no curl timing figure)"
+            fi ;;
+        ENETUNREACH)
+            ck fail "fetcher fails closed at blackhole" \
+               "ENETUNREACH means the vpn table has NO route — blackhole missing" ;;
+        CONNECTED)
+            ck fail "fetcher fails closed" "connect SUCCEEDED with tunnel down — LEAK" ;;
+        '')
+            ck unknown "fetcher fails closed" "errno probe skipped; curl said: $FETCHER_OUT" ;;
+        *)
+            ck unknown "fetcher fails closed" "unexpected errno: $ERRNO_OUT" ;;
+    esac
+
     if [ "$FETCHER_RC" -eq 0 ]; then
-        ck fail "fetcher fails closed" "probe SUCCEEDED with tunnel down: '$FETCHER_OUT' — LEAK"
-    elif printf '%s\n' "$FETCHER_OUT" | grep -qi 'unreachable'; then
-        if [ -n "$CURL_CONNECT_MS" ] && [ "$CURL_CONNECT_MS" -lt 50 ]; then
-            ck ok "fetcher fails closed at connect()" \
-               "curl ${CURL_CONNECT_MS}ms, wall ${FETCHER_MS}ms"
-        elif [ -n "$CURL_CONNECT_MS" ]; then
-            ck unknown "fetcher fails closed" \
-               "unreachable but curl took ${CURL_CONNECT_MS}ms (expected ~1ms)"
-        elif [ "$FETCHER_MS" -lt 500 ]; then
-            ck ok "fetcher fails closed" \
-               "wall ${FETCHER_MS}ms; curl gave no 'after N ms' figure"
-        else
-            ck unknown "fetcher fails closed" "unreachable but wall ${FETCHER_MS}ms"
-        fi
+        ck fail "curl as fetcher fails" "SUCCEEDED with tunnel down: '$FETCHER_OUT' — LEAK"
     else
-        ck unknown "fetcher fails closed" "rc=$FETCHER_RC in ${FETCHER_MS}ms: $FETCHER_OUT"
+        ck ok "curl as fetcher fails" "rc=$FETCHER_RC in ${FETCHER_MS}ms wall"
     fi
 fi
 
