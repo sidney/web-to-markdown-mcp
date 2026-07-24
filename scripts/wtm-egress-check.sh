@@ -24,20 +24,38 @@
 # found. Do not gate anything on it. Read the SUMMARY.
 #
 # ---------------------------------------------------------------------------
-# ON THE EXPECTED FAILURE MODE WITH THE TUNNEL DOWN (verified 2026-07-24)
+# EXPECTED FAILURE MODES WITH THE TUNNEL DOWN (verified 2026-07-24)
 #
-# The fetcher's fail-closed error is EINVAL (errno 22), NOT ENETUNREACH.
-# The kernel maps RTN_BLACKHOLE to -EINVAL, so a lookup that reaches the vpn
-# table and matches the blackhole default returns "Invalid argument" at
-# connect() time. curl renders that as the generic "Couldn't connect to
-# server", while still reporting its own "after 1 ms" timing.
+# IPv4 -> EINVAL (errno 22). The kernel maps RTN_BLACKHOLE to -EINVAL, so a
+# lookup that reaches the vpn table and matches the blackhole default fails at
+# connect() with "Invalid argument". curl renders this as the generic
+# "Couldn't connect to server" while still reporting its own "after 1 ms"
+# timing, so curl's prose is not a usable signal. Read the errno.
 #
-# These two are NOT interchangeable and the difference is diagnostic:
-#   EINVAL       -> blackhole present and governing. Correct fail-closed.
-#   ENETUNREACH  -> vpn table has NO route at all. Also fails closed, but by
-#                   accident rather than by design; the blackhole is missing.
-# Anything downstream that classifies egress errors must not key on
-# ENETUNREACH alone.
+# IPv6 -> ENETUNREACH, in BOTH tunnel states. This box has no v6 default
+# route. Tunnel down, it has no global v6 address at all; tunnel up, tun0
+# acquires one from Sonic but there is still no v6 default route. So v6
+# packets die at ROUTING, before the filter chain, and the ip6tables REJECT on
+# the fetcher uid HAS NEVER ACTUALLY FIRED. Keep that rule — it is correct
+# defence in depth and becomes load-bearing the moment a v6 route appears —
+# but do not read its presence as evidence that v6 is being blocked by it.
+#
+# WHAT ENETUNREACH ON IPv4 WOULD MEAN, AND WHAT IT DOES NOT. An earlier
+# version of this script asserted that ENETUNREACH indicates "the vpn table
+# has no route, blackhole missing". That was WRONG. Linux policy routing falls
+# through to the NEXT RULE when a table lookup finds nothing, so an empty vpn
+# table would send fetcher packets to the main table and out the datacenter IP
+# — a LEAK presenting as a SUCCESSFUL connect, not as ENETUNREACH. That is
+# precisely why the blackhole exists; if an empty table already failed closed,
+# the blackhole would be redundant. ENETUNREACH on v4 would instead mean no
+# usable route was found anywhere, i.e. the main-table default is gone too.
+#
+# CONSEQUENCE FOR ANYTHING DOWNSTREAM: two different errnos both mean "no
+# egress" here, and which one a client surfaces depends on address family, on
+# resolver ordering (which itself flips with tunnel state — see section F),
+# and on how the client aggregates errors across a multi-address attempt.
+# Do not infer tunnel state from fetch errors. Poll the route in the vpn
+# table instead.
 # ---------------------------------------------------------------------------
 
 set -u
@@ -54,9 +72,13 @@ MAIN_GW="${WTM_MAIN_GW:-10.0.0.1}"
 MAIN_IF="${WTM_MAIN_IF:-enp0s6}"
 SONIC_PREFIX="${WTM_SONIC_PREFIX:-192.184.}"   # observed pool range, not authoritative
 PROBE_URL="${WTM_PROBE_URL:-https://api.ipify.org}"
-PROBE_TARGET="${WTM_PROBE_TARGET:-1.1.1.1}"
+PROBE_TARGET="${WTM_PROBE_TARGET:-1.1.1.1}"    # v4 literal: route-get + probe fallback
 PROBE_TIMEOUT="${WTM_PROBE_TIMEOUT:-15}"
 CONTROL_UID="${WTM_CONTROL_UID:-12345}"        # a uid no ip rule matches
+# The family probe needs a host with BOTH A and AAAA records, or the v6 half
+# of the check is silently untested. example.com is dual-stack and stable.
+FAMILY_HOST="${WTM_FAMILY_HOST:-example.com}"
+FAMILY_PORT="${WTM_FAMILY_PORT:-443}"
 
 # --------------------------------------------------------------- helpers ---
 FAILS=0
@@ -89,6 +111,8 @@ ck() {    # ck ok|fail|unknown <label> [detail...]
     printf '  %s %-44s %s\n' "$mark" "$label" "$*"
 }
 
+info() { printf '  %s %-44s %s\n' '[info]' "$1" "${2:-}"; }
+
 PROBE_OUT=''; PROBE_RC=0; PROBE_MS=0
 timed_probe() {
     local label=$1
@@ -103,18 +127,81 @@ timed_probe() {
         "$label" "$PROBE_RC" "$PROBE_MS" "$(printf '%s' "$PROBE_OUT" | tr '\n' ' ')"
 }
 
-# Reports the raw errno of a connect() attempt, rather than leaving the
-# failure to be inferred from a client's prose. This is the authoritative
-# fail-closed signal; the curl probe below exists to report the exit IP.
-ERRNO_PROBE_PY='
-import errno, socket, sys
-s = socket.socket()
-s.settimeout(5)
+# Resolves a DUAL-STACK hostname and connects to every returned address
+# separately, reporting the resolver's ordering and one errno per address.
+#
+# This supersedes the old single-address probe, which connected to a v4
+# LITERAL and so could only ever exercise the v4 path. That was a near-miss
+# rather than a design: had it used a hostname with AF_UNSPEC it would have
+# reported a spurious failure on a healthy box, because the resolver puts v6
+# first when the tunnel is down and every v6 address is unreachable here.
+#
+# Machine-readable lines (ORDER / RESULT / FIRST / SUMMARY4 / SUMMARY6) are
+# parsed by the summary below; they are also meant to be human-readable.
+FAMILY_PROBE_PY='
+import errno, socket, sys, time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout = float(sys.argv[3])
+fallback_ip = sys.argv[4] if len(sys.argv) > 4 else ""
+
+FAM = {socket.AF_INET: "IPv4", socket.AF_INET6: "IPv6"}
+
+def attempt(fam, name, sa):
+    # socket() itself raises EAFNOSUPPORT on a kernel with no v6 stack, so it
+    # must sit INSIDE the try. Leaving it outside crashed the probe after the
+    # v4 rows but before the SUMMARY lines, which the caller then misread as
+    # "probe skipped".
+    s = None
+    t0 = time.monotonic()
+    try:
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(sa[:2] if fam == socket.AF_INET else sa)
+        print("RESULT", name, sa[0], "CONNECTED", int((time.monotonic() - t0) * 1000))
+        return "CONNECTED"
+    except OSError as e:
+        ms = int((time.monotonic() - t0) * 1000)
+        if e.errno:
+            code = errno.errorcode.get(e.errno, "E" + str(e.errno))
+        else:
+            code = "NOERRNO"
+        print("RESULT", name, sa[0], code, ms)
+        return code
+    finally:
+        if s is not None:
+            s.close()
+
+ordered = []
 try:
-    s.connect((sys.argv[1], 443))
-    print("OK connected")
+    for idx, item in enumerate(socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)):
+        fam, sa = item[0], item[4]
+        name = FAM.get(fam, str(fam))
+        print("ORDER", idx, name, sa[0])
+        ordered.append((fam, name, sa))
 except OSError as e:
-    print("ERR", e.errno, errno.errorcode.get(e.errno, "UNKNOWN"), "-", e.strerror)
+    print("RESOLVE_FAIL", type(e).__name__, e)
+
+if ordered:
+    print("FIRST", ordered[0][1])
+elif fallback_ip:
+    print("FIRST", "IPv4-literal-fallback")
+    ordered = [(socket.AF_INET, "IPv4", (fallback_ip, port))]
+
+seen = {}
+for fam, name, sa in ordered:
+    seen.setdefault(name, []).append(attempt(fam, name, sa))
+
+for name in ("IPv4", "IPv6"):
+    got = seen.get(name)
+    if not got:
+        value = "NONE"
+    elif "CONNECTED" in got:
+        value = "CONNECTED"
+    else:
+        value = got[0]
+    print("SUMMARY" + name[-1], value)
 '
 
 # ------------------------------------------------------------ preflight ---
@@ -158,6 +245,10 @@ printf 'tunnel state (by route in table %s): %s\n' "$VPN_TABLE" "$MODE"
 # --------------------------------------------------------------- A: rules --
 section "A. ip rules (expect 999 uidrange, 1000 fwmark, both -> $VPN_TABLE)"
 run ip rule list
+printf '\n'
+printf '# v6 rules are shown for completeness. There is deliberately no v6\n'
+printf '# policy routing here; v6 is blocked by absence of a route (see E).\n'
+run ip -6 rule list
 
 # -------------------------------------------------------------- B: routes --
 section "B. routes"
@@ -216,6 +307,11 @@ fi
 section "D. tun0"
 run ip -br link show tun0
 run ip -4 -br addr show tun0
+printf '\n'
+printf '# tun0 picks up a global v6 address from Sonic when the tunnel is up,\n'
+printf '# even though no v6 DEFAULT ROUTE is installed. Presence of an address\n'
+printf '# here is therefore not evidence that v6 egress works.\n'
+run ip -6 -br addr show tun0
 
 # Find the token after "inet" rather than a fixed field number: `ip -o addr`
 # prefixes a device index, `ip -br addr` does not, and a net30-topology tun0
@@ -228,24 +324,57 @@ TUN_ADDR=$(ip -4 -o addr show dev tun0 2>/dev/null \
 section "E. packet marking / v6 posture"
 run iptables -t mangle -S OUTPUT
 run ip6tables -S OUTPUT
+printf '\n'
+printf '# The REJECT rule above only fires if a v6 packet survives routing.\n'
+printf '# On this box it never has: there is no v6 default route in either\n'
+printf '# tunnel state, so v6 dies earlier, with ENETUNREACH. If a default\n'
+printf '# route ever appears below, that rule stops being inert and starts\n'
+printf '# being the thing that blocks v6 — worth noticing when it happens.\n'
+run ip -6 route show default
+V6_DEFAULT=$(ip -6 route show default 2>/dev/null)
+run ip -6 addr show scope global
 
 # -------------------------------------------------------------- F: probes --
 section "F. probes"
 printf '  DNS resolves OUTSIDE the tunnel by design (loopback stub, priority-0\n'
-printf '  local table). So with the tunnel down a hostname still resolves and the\n'
-printf '  failure appears at connect, as EINVAL from the blackhole in about 1ms.\n\n'
+printf '  local table), so a hostname still resolves with the tunnel down and\n'
+printf '  the failure appears later, at connect.\n\n'
+printf '  RESOLVER ORDERING FLIPS WITH TUNNEL STATE (observed 2026-07-24, same\n'
+printf '  host, same target, minutes apart): tunnel DOWN returned both IPv6\n'
+printf '  addresses first, tunnel UP returned both IPv4 first. Likely RFC 6724\n'
+printf '  destination selection reacting to whether a global v6 SOURCE address\n'
+printf '  exists on tun0 — inference, not measured. The practical effect is that\n'
+printf '  with the tunnel down, the FIRST connect error a dual-stack client meets\n'
+printf '  is v6 ENETUNREACH, not the v4 EINVAL from the blackhole.\n\n'
 
-ERRNO_NAME=''
+FAMILY_OUT=''
+V4_RESULT=''
+V6_RESULT=''
+FIRST_FAMILY=''
+FAMILY_STATE=skipped   # skipped | ok | crashed
 if [ -n "$FETCHER_UID" ] && command -v python3 >/dev/null 2>&1; then
-    timed_probe "connect() as $FETCHER_USER" \
-        sudo -u "$FETCHER_USER" python3 -c "$ERRNO_PROBE_PY" "$PROBE_TARGET"
-    ERRNO_OUT=$PROBE_OUT
-    ERRNO_NAME=$(printf '%s\n' "$ERRNO_OUT" | awk '$1 == "ERR" {print $3; exit}')
-    printf '%s\n' "$ERRNO_OUT" | grep -q '^OK connected' && ERRNO_NAME=CONNECTED
+    printf '  $ as %s: resolve %s:%s, then connect to EVERY address separately\n' \
+        "$FETCHER_USER" "$FAMILY_HOST" "$FAMILY_PORT"
+    FAMILY_OUT=$(sudo -u "$FETCHER_USER" python3 -c "$FAMILY_PROBE_PY" \
+        "$FAMILY_HOST" "$FAMILY_PORT" "$PROBE_TIMEOUT" "$PROBE_TARGET" 2>&1)
+    printf '%s\n' "$FAMILY_OUT" | sed 's/^/    /'
+    V4_RESULT=$(printf '%s\n' "$FAMILY_OUT" | awk '$1 == "SUMMARY4" {print $2; exit}')
+    V6_RESULT=$(printf '%s\n' "$FAMILY_OUT" | awk '$1 == "SUMMARY6" {print $2; exit}')
+    FIRST_FAMILY=$(printf '%s\n' "$FAMILY_OUT" | awk '$1 == "FIRST" {print $2; exit}')
+    # Missing SUMMARY lines mean the probe died partway. That is NOT the same
+    # as never running it, and must not be reported as if it were.
+    if [ -z "$V4_RESULT" ] || [ -z "$V6_RESULT" ]; then
+        FAMILY_STATE=crashed
+        printf '\n  WARNING: the family probe produced no SUMMARY line — it exited\n'
+        printf '  early. Results above are partial; treat the v4/v6 verdicts below\n'
+        printf '  as unmeasured rather than as passes.\n'
+    else
+        FAMILY_STATE=ok
+    fi
 else
-    ERRNO_OUT=''
-    printf '  connect() as %s        SKIPPED (no user, or python3 absent)\n' "$FETCHER_USER"
+    printf '  family probe SKIPPED (no fetcher user, or python3 absent)\n'
 fi
+printf '\n'
 
 if [ -n "$FETCHER_UID" ]; then
     timed_probe "curl as $FETCHER_USER" \
@@ -306,11 +435,42 @@ else
     ck fail "mangle OUTPUT: fetcher mark rule" "not present"
 fi
 
+# Presence of the rule is checked separately from whether it is doing anything.
 if printf '%s\n' "$V6RULES" | grep -q -- "--uid-owner ${FETCHER_USER}\|--uid-owner ${FETCHER_UID}"; then
-    ck ok "ip6tables OUTPUT: fetcher REJECT" "deliberate v4-only policy"
+    if [ -n "$V6_DEFAULT" ]; then
+        ck ok "ip6tables OUTPUT: fetcher REJECT" "present AND load-bearing (a v6 default route exists)"
+    else
+        ck ok "ip6tables OUTPUT: fetcher REJECT" "present but INERT — no v6 default route; v6 dies at routing"
+    fi
 else
-    ck fail "ip6tables OUTPUT: fetcher REJECT" "not present"
+    if [ -n "$V6_DEFAULT" ]; then
+        ck fail "ip6tables OUTPUT: fetcher REJECT" "MISSING and a v6 default route exists — v6 can leak"
+    else
+        ck fail "ip6tables OUTPUT: fetcher REJECT" "not present (currently masked by absence of a v6 route)"
+    fi
 fi
+
+# The empirical half: whatever the rules say, did v6 actually go anywhere?
+case "$V6_RESULT" in
+    CONNECTED)
+        ck fail "IPv6 does not egress" "v6 CONNECTED — v4-only policy breached, LEAK" ;;
+    ENETUNREACH)
+        ck ok "IPv6 does not egress" "ENETUNREACH: no route, as expected on this box" ;;
+    ECONNREFUSED|EACCES|EHOSTUNREACH)
+        ck ok "IPv6 does not egress" "$V6_RESULT: blocked after routing — the REJECT rule is now firing" ;;
+    EAFNOSUPPORT)
+        ck ok "IPv6 does not egress" "no v6 stack in this kernel at all" ;;
+    NONE)
+        ck unknown "IPv6 does not egress" "$FAMILY_HOST returned no AAAA; set WTM_FAMILY_HOST to a dual-stack host" ;;
+    '')
+        if [ "$FAMILY_STATE" = crashed ]; then
+            ck unknown "IPv6 does not egress" "family probe exited early — UNMEASURED"
+        else
+            ck unknown "IPv6 does not egress" "family probe skipped"
+        fi ;;
+    *)
+        ck unknown "IPv6 does not egress" "unexpected result: $V6_RESULT" ;;
+esac
 
 if [ "$(systemctl is-active "$ROUTING_UNIT" 2>&1)" = active ]; then
     ck ok "$ROUTING_UNIT active"
@@ -350,6 +510,10 @@ else
        "unexpected: $CONTROL_GET — treat uid route-get results as unreliable"
 fi
 
+if [ -n "$FIRST_FAMILY" ]; then
+    info "resolver returns first" "$FIRST_FAMILY (expect IPv6 when down, IPv4 when up — not a fault either way)"
+fi
+
 if [ "$MODE" = UP ]; then
     printf '\n  Tunnel UP expectations:\n'
 
@@ -373,10 +537,15 @@ if [ "$MODE" = UP ]; then
         fi
     fi
 
-    case "$ERRNO_NAME" in
-        CONNECTED) ck ok "connect() as $FETCHER_USER succeeds" ;;
-        '')        ck unknown "connect() as $FETCHER_USER" "probe skipped" ;;
-        *)         ck fail "connect() as $FETCHER_USER succeeds" "$ERRNO_OUT" ;;
+    case "$V4_RESULT" in
+        CONNECTED) ck ok "IPv4 connect as $FETCHER_USER succeeds" ;;
+        '')
+            if [ "$FAMILY_STATE" = crashed ]; then
+                ck unknown "IPv4 connect as $FETCHER_USER" "family probe exited early — UNMEASURED"
+            else
+                ck unknown "IPv4 connect as $FETCHER_USER" "family probe skipped"
+            fi ;;
+        *)         ck fail "IPv4 connect as $FETCHER_USER succeeds" "got $V4_RESULT with the tunnel up" ;;
     esac
 
     case "$FETCHER_OUT" in
@@ -427,24 +596,31 @@ else
     CURL_CONNECT_MS=$(printf '%s\n' "$FETCHER_OUT" \
         | sed -n 's/.*after \([0-9][0-9]*\) ms.*/\1/p' | head -n1)
 
-    case "$ERRNO_NAME" in
+    case "$V4_RESULT" in
         EINVAL)
             if [ -n "$CURL_CONNECT_MS" ] && [ "$CURL_CONNECT_MS" -lt 50 ]; then
-                ck ok "fetcher fails closed at blackhole" \
+                ck ok "IPv4 fails closed at blackhole" \
                    "EINVAL, curl connect ${CURL_CONNECT_MS}ms"
             else
-                ck ok "fetcher fails closed at blackhole" \
+                ck ok "IPv4 fails closed at blackhole" \
                    "EINVAL (no curl timing figure)"
             fi ;;
-        ENETUNREACH)
-            ck fail "fetcher fails closed at blackhole" \
-               "ENETUNREACH means the vpn table has NO route — blackhole missing" ;;
         CONNECTED)
-            ck fail "fetcher fails closed" "connect SUCCEEDED with tunnel down — LEAK" ;;
+            ck fail "IPv4 fails closed at blackhole" \
+               "connect SUCCEEDED with the tunnel down — LEAK" ;;
+        ENETUNREACH)
+            # NOT "the blackhole is missing" — an empty vpn table would fall
+            # through to main and LEAK instead. See the header.
+            ck fail "IPv4 fails closed at blackhole" \
+               "ENETUNREACH, not EINVAL — the blackhole did not answer. Check that the vpn blackhole AND the main default both exist" ;;
         '')
-            ck unknown "fetcher fails closed" "errno probe skipped; curl said: $FETCHER_OUT" ;;
+            if [ "$FAMILY_STATE" = crashed ]; then
+                ck unknown "IPv4 fails closed at blackhole" "family probe exited early — UNMEASURED; curl said: $FETCHER_OUT"
+            else
+                ck unknown "IPv4 fails closed at blackhole" "family probe skipped; curl said: $FETCHER_OUT"
+            fi ;;
         *)
-            ck unknown "fetcher fails closed" "unexpected errno: $ERRNO_OUT" ;;
+            ck unknown "IPv4 fails closed at blackhole" "unexpected result: $V4_RESULT" ;;
     esac
 
     if [ "$FETCHER_RC" -eq 0 ]; then
