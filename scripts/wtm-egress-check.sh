@@ -113,6 +113,33 @@ ck() {    # ck ok|fail|unknown <label> [detail...]
 
 info() { printf '  %s %-44s %s\n' '[info]' "$1" "${2:-}"; }
 
+# Run a command as the fetcher uid.
+#
+# NOT sudo, deliberately. sudo logs the FULL command line plus a PAM session
+# open/close pair for every invocation. The family probe passes ~57 lines of
+# Python on the command line, so each run wrote that entire script into the
+# journal. Under wtm-egress-guard.timer that is ~10 lines of noise every 15
+# minutes, which buries `journalctl -u wtm-egress-guard` and defeats the
+# guard's whole "silent on success, loud on failure" design.
+#
+# setpriv is a thin execve wrapper: it drops privileges and execs, with no
+# PAM and no logging. --clear-groups matters — without it the process keeps
+# root's supplementary groups, which would be a real privilege leak in a
+# script whose entire subject is privilege boundaries.
+#
+# setpriv does NOT modify the environment, so HOME would otherwise stay at
+# root's. Set it explicitly rather than leaving curl to probe an unreadable
+# /root/.curlrc on every call.
+as_fetcher() {
+    if [ -n "$SETPRIV_BIN" ] && [ -n "$FETCHER_UID" ] && [ -n "$FETCHER_GID" ]; then
+        env HOME=/tmp "$SETPRIV_BIN" \
+            --reuid="$FETCHER_UID" --regid="$FETCHER_GID" --clear-groups -- "$@"
+    else
+        # Fallback for a host without setpriv. Works identically, just noisy.
+        sudo -u "$FETCHER_USER" -- "$@"
+    fi
+}
+
 PROBE_OUT=''; PROBE_RC=0; PROBE_MS=0
 timed_probe() {
     local label=$1
@@ -253,10 +280,16 @@ printf ' wtm-egress-check   started %s\n' "$STARTED_AT"
 printf ' host %s   read-only snapshot, changes nothing\n' "$(hostname)"
 printf '===============================================================\n'
 
+SETPRIV_BIN=$(command -v setpriv 2>/dev/null || true)
+
 if FETCHER_UID=$(id -u "$FETCHER_USER" 2>/dev/null); then
-    printf '\nfetcher user: %s  uid %s\n' "$FETCHER_USER" "$FETCHER_UID"
+    FETCHER_GID=$(id -g "$FETCHER_USER" 2>/dev/null || echo '')
+    printf '\nfetcher user: %s  uid %s  gid %s%s\n' \
+        "$FETCHER_USER" "$FETCHER_UID" "${FETCHER_GID:-?}" \
+        "$([ -n "$SETPRIV_BIN" ] && echo '' || echo '  (setpriv absent — falling back to sudo)')"
 else
     FETCHER_UID=''
+    FETCHER_GID=''
     printf '\nfetcher user: %s  NOT FOUND\n' "$FETCHER_USER"
 fi
 
@@ -384,7 +417,7 @@ FAMILY_STATE=skipped   # skipped | ok | crashed
 if [ -n "$FETCHER_UID" ] && command -v python3 >/dev/null 2>&1; then
     printf '  $ as %s: resolve %s:%s, then connect to EVERY address separately\n' \
         "$FETCHER_USER" "$FAMILY_HOST" "$FAMILY_PORT"
-    FAMILY_OUT=$(sudo -u "$FETCHER_USER" python3 -c "$FAMILY_PROBE_PY" \
+    FAMILY_OUT=$(as_fetcher python3 -c "$FAMILY_PROBE_PY" \
         "$FAMILY_HOST" "$FAMILY_PORT" "$PROBE_TIMEOUT" "$PROBE_TARGET" 2>&1)
     printf '%s\n' "$FAMILY_OUT" | sed 's/^/    /'
     V4_RESULT=$(printf '%s\n' "$FAMILY_OUT" | awk '$1 == "SUMMARY4" {print $2; exit}')
@@ -407,7 +440,7 @@ printf '\n'
 
 if [ -n "$FETCHER_UID" ]; then
     timed_probe "curl as $FETCHER_USER" \
-        sudo -u "$FETCHER_USER" curl -sS --max-time "$PROBE_TIMEOUT" "$PROBE_URL"
+        as_fetcher curl -sS --max-time "$PROBE_TIMEOUT" "$PROBE_URL"
     FETCHER_OUT=$PROBE_OUT; FETCHER_RC=$PROBE_RC; FETCHER_MS=$PROBE_MS
 else
     FETCHER_OUT=''; FETCHER_RC=-1; FETCHER_MS=0
@@ -654,6 +687,11 @@ else
 
     if [ "$FETCHER_RC" -eq 0 ]; then
         ck fail "curl as fetcher fails" "SUCCEEDED with tunnel down: '$FETCHER_OUT' — LEAK"
+    elif [ "$FETCHER_RC" -eq -1 ]; then
+        # The probe never ran (no fetcher account). "Did not succeed" is not
+        # the same as "failed closed", and reporting it as a pass would be the
+        # same unmeasured-as-healthy conflation this script exists to avoid.
+        ck unknown "curl as fetcher fails" "probe never ran — fetcher account missing"
     else
         ck ok "curl as fetcher fails" "rc=$FETCHER_RC in ${FETCHER_MS}ms wall"
     fi
