@@ -32,6 +32,17 @@ Design notes worth remembering:
     404 also avoids the /.well-known/openid-configuration trap: anything
     served there is validated strictly as OIDC discovery, and a malformed
     document dead-ends the client silently instead of erroring usefully.
+  * LOGGING NEEDS EXPLICIT SETUP AND THE FAILURE IS SILENT. Nothing else in
+    this process attaches a handler for the web_to_markdown_mcp logger, and
+    uvicorn.run(log_level=...) configures only uvicorn's OWN loggers through
+    its dictConfig. Without _configure_logging() below, records from this
+    module find no handler anywhere in the chain and fall to
+    logging.lastResort, which is hard-wired to WARNING -- so the 401
+    warnings reach the journal while every logger.info() disappears without
+    trace. Observed exactly that way on 2026-07-26: the 404 branch ran and
+    answered on the wire, and its INFO line never appeared. The tell is
+    formatting, if it happens again: lastResort emits a bare message with no
+    level prefix, whereas uvicorn's configured handler pads "INFO:     ".
   * Fail closed: if the key file is missing or empty, every request is 401.
     (The /.well-known/ 404 above is the sole exception, and it never
     consults the key file at all.)
@@ -45,6 +56,7 @@ Config via environment (all optional except you must create the key file):
                      origin protection      (ADD the tunnel hostname on deploy)
   WTM_RATE_CAPACITY  token-bucket burst     default 20
   WTM_RATE_REFILL    tokens refilled/sec    default 0.5  (~30/min steady)
+  WTM_LOG_LEVEL      level for THIS package default INFO  (not uvicorn's)
 
 Key file format: one key per line, blank lines and #-comments ignored.
 Multiple lines let you rotate with overlap (add new, switch client, remove
@@ -77,6 +89,7 @@ ALLOWED_HOSTS = [h.strip() for h in os.environ.get(
     "WTM_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",") if h.strip()]
 RATE_CAPACITY = float(os.environ.get("WTM_RATE_CAPACITY", "20"))
 RATE_REFILL = float(os.environ.get("WTM_RATE_REFILL", "0.5"))
+LOG_LEVEL = os.environ.get("WTM_LOG_LEVEL", "INFO").upper()
 
 # --- key loading (rotatable without restart, cached by mtime) --------------
 _keys_cache: tuple[float, frozenset[str]] = (-1.0, frozenset())
@@ -147,6 +160,45 @@ class _ScrubKeyFilter(logging.Filter):
         return True
 
 
+def _configure_logging() -> None:
+    """Attach a handler and a level for this package's logger.
+
+    See the LOGGING note in the module docstring for why this is needed at
+    all. Two choices here are deliberate.
+
+    SCOPED TO THIS PACKAGE, not logging.basicConfig(). basicConfig would work
+    and is one line shorter, but it sets the level on the ROOT logger, which
+    turns on INFO for every library in the process -- httpx and patchright
+    among them. Those log the URLs being fetched, and a page-fetching service
+    writing its target URLs into the system journal is the last thing wanted.
+
+    THE SCRUB FILTER GOES ON THE HANDLER, not only on loggers. A filter
+    attached to a logger is consulted only for records logged through that
+    logger DIRECTLY: callHandlers walks ancestors collecting their HANDLERS
+    and never re-applies ancestor loggers' filters. A scrub filter on the
+    root logger therefore never sees a child's records -- a no-op dressed up
+    as protection. On the handler it sees every record that reaches it, no
+    matter which child logger produced it.
+    """
+    scrub = _ScrubKeyFilter()
+
+    pkg = logging.getLogger("web_to_markdown_mcp")
+    pkg.setLevel(LOG_LEVEL)
+    if not pkg.handlers:
+        h = logging.StreamHandler()  # stderr -> journal under systemd
+        h.setFormatter(logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
+        h.addFilter(scrub)
+        pkg.addHandler(h)
+    # It has its own handler now, so reaching root gains nothing, and
+    # propagating would double every line if anything ever calls basicConfig.
+    pkg.propagate = False
+
+    # uvicorn's loggers get their handlers from its own dictConfig, which
+    # this process does not own, so the logger is the only place to scrub.
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        logging.getLogger(name).addFilter(scrub)
+
+
 # --- the gate (pure ASGI) --------------------------------------------------
 async def _send_json(send, status: int, body: dict) -> None:
     data = json.dumps(body).encode()
@@ -210,9 +262,7 @@ def _build_app():
 
 
 def main() -> None:
-    for name in ("", "uvicorn", "uvicorn.access", "uvicorn.error",
-                 "web_to_markdown_mcp.http"):
-        logging.getLogger(name).addFilter(_ScrubKeyFilter())
+    _configure_logging()
     if not _load_keys():
         logger.warning("no keys loaded from %s -- every request will 401 until "
                        "you create it (one key per line)", KEYFILE)
