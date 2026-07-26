@@ -204,6 +204,35 @@ for name in ("IPv4", "IPv6"):
     print("SUMMARY" + name[-1], value)
 '
 
+# ------------------------------------------------------------ arguments ---
+# By default this script ALWAYS exits 0 (see the header): the snapshot was
+# taken, and any verdict belongs to the human reading it. --status opts into
+# a machine-readable exit code so a monitor can act on it without parsing
+# prose. Parsing the summary text would be the same mistake as reading curl's
+# error message instead of the errno.
+#
+#   exit 0    no failures, no indeterminates
+#   exit N    N checks FAILED (capped at 125)
+#   exit 100  no failures, but one or more checks were INDETERMINATE
+#             ("could not measure" is not "fine" — that conflation is exactly
+#             how a oneshot unit reported active for 17.5 hours with no floor)
+EXIT_WITH_STATUS=no
+case "${1:-}" in
+    --status)
+        EXIT_WITH_STATUS=yes ;;
+    --help|-h)
+        sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+        echo
+        echo "usage: wtm-egress-check [--status]"
+        exit 0 ;;
+    "")
+        ;;
+    *)
+        echo "wtm-egress-check: unknown argument '$1'" >&2
+        echo "usage: wtm-egress-check [--status]" >&2
+        exit 2 ;;
+esac
+
 # ------------------------------------------------------------ preflight ---
 if [ -z "${EPOCHREALTIME:-}" ]; then
     echo "wtm-egress-check: needs bash 5.0+ (EPOCHREALTIME)." >&2
@@ -642,5 +671,15 @@ printf ' finished %s   (%s ms elapsed)\n' "$FINISHED_AT" "$ELAPSED_MS"
 printf ' If anything could have started or stopped the tunnel inside that\n'
 printf ' window, this snapshot straddles a transition. Run it again.\n'
 printf '===============================================================\n'
+
+if [ "$EXIT_WITH_STATUS" = yes ]; then
+    if [ "$FAILS" -gt 0 ]; then
+        [ "$FAILS" -gt 125 ] && exit 125
+        exit "$FAILS"
+    fi
+    if [ "$UNKNOWNS" -gt 0 ]; then
+        exit 100
+    fi
+fi
 
 exit 0

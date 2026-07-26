@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# wtm-egress-guard — periodic verification that the fetcher's fail-closed
+# egress floor still exists. Run from wtm-egress-guard.timer.
+#
+# WHY THIS EXISTS (incident 2026-07-25/26)
+# An unattended systemd upgrade restarted systemd-networkd, which deleted the
+# two ip rules and the blackhole route that make the fetcher fail closed. The
+# floor stayed gone for ~17.5 HOURS. Nothing noticed, because
+# wtm-vpn-routing.service is Type=oneshot with RemainAfterExit=yes: systemd
+# tracks only that its setup command once returned 0, never that its effects
+# still exist. It reported "active (exited)" throughout. The leak was found by
+# accident, when a probe expected to fail succeeded instead.
+#
+# The lesson generalises past the specific cause: `active` is a claim about
+# the past. This script turns "the floor exists" into something checked in the
+# present, on a schedule.
+#
+# WHAT IT DOES
+#   - runs `wtm-egress-check --status`, which exits 0 / N-failures / 100
+#   - on success: prints NOTHING and exits 0, so the journal stays readable
+#     across ~96 runs a day
+#   - on failure: prints the ENTIRE snapshot to the journal, so the evidence
+#     is captured at the moment of failure rather than reconstructed later,
+#     and exits non-zero so the unit enters `failed` and OnFailure= fires
+#
+# WHAT IT DELIBERATELY DOES NOT DO
+#   - it does not repair anything. Restarting wtm-vpn-routing here would fight
+#     whatever removed the rules and could loop indefinitely. Containment is a
+#     separate unit (wtm-egress-contain.service) reached via OnFailure=, and
+#     repair is a human decision.
+#   - it does not treat "could not measure" as "fine". Exit 100 from the check
+#     means indeterminate, and this script escalates it like any other
+#     failure. Conflating unmeasured with healthy is precisely the mistake
+#     that let the incident run for 17.5 hours.
+
+set -u
+
+CHECK="${WTM_CHECK_BIN:-/usr/local/bin/wtm-egress-check}"
+
+if [ ! -x "$CHECK" ]; then
+    echo "wtm-egress-guard: $CHECK is missing or not executable." >&2
+    echo "  The floor is therefore UNVERIFIED. Treating this as a failure." >&2
+    exit 3
+fi
+
+output=$("$CHECK" --status 2>&1)
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+    exit 0
+fi
+
+# Non-zero. Say what kind of non-zero it is before dumping the snapshot, so
+# the first line in the journal is the verdict rather than a banner.
+case "$rc" in
+    100) echo "wtm-egress-guard: INDETERMINATE — one or more checks could not be measured." ;;
+    125) echo "wtm-egress-guard: FAILED — 125 or more checks failed." ;;
+    *)   echo "wtm-egress-guard: FAILED — $rc check(s) failed." ;;
+esac
+echo "wtm-egress-guard: full snapshot follows. The fetcher may be leaking out"
+echo "wtm-egress-guard: the datacenter IP. See wtm-egress-contain.service."
+echo
+printf '%s\n' "$output"
+
+exit "$rc"
