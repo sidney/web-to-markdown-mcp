@@ -19,7 +19,22 @@ Design notes worth remembering:
     load-bearing: FastMCP's streamable-HTTP session manager raises
     "task group not initialized" on every request if its lifespan does not
     run, and the lifespan only runs if these scopes reach the inner app.
+  * /.well-known/* is answered 404 by the gate itself, BEFORE the key check.
+    This is the one deliberate hole in an otherwise fail-closed gate, so it
+    is worth understanding rather than trimming. The connector-registration
+    flow probes those paths with NO query string, so it cannot present
+    ?key=. A 401 there reads to the client as "OAuth is required but its
+    metadata is undiscoverable", which is a dead end rather than a retry --
+    this is exactly what broke Open Brain's registration. 404 says plainly
+    "this server does not do OAuth", and the client falls back to using the
+    URL it was handed, key and all. The hole exposes no tool, no data and no
+    MCP endpoint; it returns a fixed 404 body and never reads the key file.
+    404 also avoids the /.well-known/openid-configuration trap: anything
+    served there is validated strictly as OIDC discovery, and a malformed
+    document dead-ends the client silently instead of erroring usefully.
   * Fail closed: if the key file is missing or empty, every request is 401.
+    (The /.well-known/ 404 above is the sole exception, and it never
+    consults the key file at all.)
 
 Config via environment (all optional except you must create the key file):
   WTM_HTTP_HOST      bind address           default 127.0.0.1 (localhost only)
@@ -141,8 +156,16 @@ async def _send_json(send, status: int, body: dict) -> None:
     await send({"type": "http.response.body", "body": data})
 
 
+# Discovery paths the client probes before it can present a key. Matched on
+# the ASGI scope path, which the server has already percent-decoded, so
+# /%2Ewell-known/x arrives here as /.well-known/x and is caught. Kept narrow
+# deliberately: anything this does NOT match falls through to the key gate
+# and 401s, which is the safe direction to be wrong in.
+_WELL_KNOWN = "/.well-known"
+
+
 class Gate:
-    """Rate-limit by IP, then require a valid ?key=. Everything else passes."""
+    """Rate-limit by IP, 404 the OAuth probes, then require a valid ?key=."""
 
     def __init__(self, app):
         self.app = app
@@ -153,6 +176,19 @@ class Gate:
             return await self.app(scope, receive, send)
         if not _rate_ok(_client_ip(scope)):
             return await _send_json(send, 429, {"error": "rate limited"})
+        # AFTER the rate limiter, BEFORE the key gate. After, because an
+        # endpoint reachable without a key must still be metered -- an
+        # unmetered hole is a hole. Before, because the whole point is that
+        # these requests cannot carry a key. Registration sends a handful of
+        # probes against a burst capacity of 20, so metering costs nothing.
+        path = scope.get("path", "")
+        if path == _WELL_KNOWN or path.startswith(_WELL_KNOWN + "/"):
+            # Logged at INFO on purpose: uvicorn runs with access_log=False,
+            # so without this there is no evidence a probe ever arrived, and
+            # "did the request reach the server at all" is the first question
+            # when registration fails. These fire only during registration.
+            logger.info("discovery probe %s -> 404 (no OAuth on this server)", path)
+            return await _send_json(send, 404, {"error": "not found"})
         key = parse_qs(scope.get("query_string", b"").decode("latin-1")).get("key", [""])[0]
         if not _key_ok(key):
             logger.warning("rejected %s (bad/missing key)", scope.get("path", "?"))
